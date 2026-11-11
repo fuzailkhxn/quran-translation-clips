@@ -1,0 +1,689 @@
+<script lang="ts">
+	import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+	import { slide } from 'svelte/transition';
+	import toast from 'svelte-5-french-toast';
+	import ModalManager from '../ModalManager';
+	import { get } from 'svelte/store';
+	import LL from '$lib/i18n/i18n-svelte';
+	import type { TranslationFunctions } from '$lib/i18n/i18n-types';
+	import {
+		applyHifzRepetitionToProject,
+		getHifzToolSummary,
+		normalizeSilenceBetweenRepetitionsMultiplier,
+		type HifzRepeatTarget,
+		type HifzSequenceMode
+	} from '$lib/services/HifzHelper';
+
+	type HifzToolTranslations = TranslationFunctions['tools'] & {
+		standardSequence: () => string;
+		standardSequenceHelp: () => string;
+		linkedSequence: () => string;
+		linkedSequenceDescription: () => string;
+		individualRepeatCount: () => string;
+		individualRepeatCountHelp: () => string;
+		firstLastRepeatCount: () => string;
+		firstLastRepeatCountHelp: () => string;
+		linkedBlockSize: () => string;
+		linkedBlockSizeHelp: () => string;
+		linkedRepeatCount: () => string;
+		linkedRepeatCountHelp: () => string;
+		playFullAtStart: () => string;
+		playFullAtStartHelp: () => string;
+		playFullAtEnd: () => string;
+		playFullAtEndHelp: () => string;
+		pauseBetweenRepeats: () => string;
+		pauseBetweenRepeatsHelp: () => string;
+		pauseBetweenGroups: () => string;
+		pauseBetweenGroupsHelp: () => string;
+		repetitionSelection: () => string;
+		repetitionSelectionDescription: () => string;
+	};
+
+	type HifzGenerationProgressEvent = {
+		progress?: number;
+		currentTime?: number;
+		totalTime?: number;
+		message?: string;
+	};
+
+	let { close }: { close: () => void } = $props();
+
+	let repeatCount = $state(3);
+	let repeatTarget = $state<HifzRepeatTarget>('verse');
+	let sequenceMode = $state<HifzSequenceMode>('standard');
+	let linkedBlockSize = $state(2);
+	let linkedRepeatCount = $state(1);
+	let firstLastRepeatCount = $state(2);
+	let includeFullSequenceAtStart = $state(true);
+	let includeFullSequenceAtEnd = $state(true);
+	let preserveVisualMerges = $state(true);
+	let silenceBetweenRepetitionsMultiplier = $state(0);
+	let silenceBetweenGroupsMultiplier = $state(0);
+	let showSubtitlesDuringPause = $state(false);
+	let extendCompleteSubtitlesAcrossRepetitions = $state(true);
+	let isRunning = $state(false);
+	let errorMessage = $state<string | null>(null);
+	let hifzProgress = $state(0);
+	let hifzProgressMessage = $state('');
+	let hifzCurrentTime = $state(0);
+	let hifzTotalTime = $state(0);
+
+	const initialSummary = getHifzToolSummary();
+	let repeatedSourceIds = $state(
+		initialSummary.sources.filter((source) => source.kind === 'subtitle').map((source) => source.id)
+	);
+	const summary = $derived(getHifzToolSummary());
+	const hifzText = $derived($LL.tools as HifzToolTranslations);
+	const canApply = $derived(summary.subtitleCount > 0 && !isRunning);
+
+	/**
+	 * Normalise le nombre de répétitions Hifz.
+	 *
+	 * @param {number} value Valeur saisie dans la modale.
+	 * @returns {number} Nombre entier utilisable.
+	 */
+	function normalizeRepeatCount(value: number, minimum: number = 1): number {
+		return Math.max(minimum, Math.round(Number.isFinite(value) ? value : minimum));
+	}
+
+	/**
+	 * Met à jour le nombre de répétitions affiché par la modale.
+	 *
+	 * @param {number} value Valeur saisie par l'utilisateur.
+	 * @returns {void}
+	 */
+	function setRepeatCount(value: number): void {
+		repeatCount = normalizeRepeatCount(value, sequenceMode === 'linked' ? 1 : 2);
+	}
+
+	/**
+	 * Active ou desactive un sous-titre dans les repetitions d'entrainement.
+	 *
+	 * @param {number} sourceId Identifiant du sous-titre source.
+	 * @param {boolean} repeated Etat de repetition demande.
+	 * @returns {void}
+	 */
+	function setSourceRepeated(sourceId: number, repeated: boolean): void {
+		repeatedSourceIds = repeated
+			? [...repeatedSourceIds, sourceId]
+			: repeatedSourceIds.filter((id) => id !== sourceId);
+	}
+
+	/**
+	 * Met à jour le multiplicateur de silence entre répétitions.
+	 *
+	 * @param {number} value Valeur saisie par l'utilisateur.
+	 * @returns {void}
+	 */
+	function setSilenceBetweenRepetitionsMultiplier(value: number): void {
+		silenceBetweenRepetitionsMultiplier = normalizeSilenceBetweenRepetitionsMultiplier(value);
+		if (silenceBetweenRepetitionsMultiplier > 0 && !showSubtitlesDuringPause) {
+			extendCompleteSubtitlesAcrossRepetitions = false;
+		}
+	}
+
+	/**
+	 * Met à jour l'affichage des sous-titres pendant les pauses.
+	 *
+	 * @param {boolean} value Etat coche demande.
+	 * @returns {void}
+	 */
+	function setShowSubtitlesDuringPause(value: boolean): void {
+		showSubtitlesDuringPause = value;
+		if (
+			!showSubtitlesDuringPause &&
+			(silenceBetweenRepetitionsMultiplier > 0 || silenceBetweenGroupsMultiplier > 0)
+		) {
+			extendCompleteSubtitlesAcrossRepetitions = false;
+		}
+	}
+
+	/**
+	 * Contraint une progression dans l'intervalle affichable.
+	 *
+	 * @param {number} value Progression brute envoyée par ffmpeg.
+	 * @returns {number} Progression bornée entre 0 et 100.
+	 */
+	function clampProgress(value: number): number {
+		return Math.max(0, Math.min(100, value));
+	}
+
+	/**
+	 * Formate une durée en secondes pour l'affichage de progression.
+	 *
+	 * @param {number} seconds Durée en secondes.
+	 * @returns {string} Durée formatée en minutes et secondes.
+	 */
+	function formatProgressTime(seconds: number): string {
+		const safeSeconds = Math.max(0, Math.round(Number.isFinite(seconds) ? seconds : 0));
+		const minutes = Math.floor(safeSeconds / 60);
+		const remainingSeconds = safeSeconds % 60;
+		return `${minutes}:${remainingSeconds.toString().padStart(2, '0')}`;
+	}
+
+	/**
+	 * Ecoute la progression ffmpeg de génération Hifz.
+	 *
+	 * @returns {Promise<UnlistenFn>} Fonction de désabonnement de l'évènement Tauri.
+	 */
+	async function listenHifzProgress(): Promise<UnlistenFn> {
+		return listen<HifzGenerationProgressEvent>('hifz-generation-progress', (event) => {
+			if (typeof event.payload.progress === 'number') {
+				hifzProgress = clampProgress(event.payload.progress);
+			}
+			if (typeof event.payload.currentTime === 'number') {
+				hifzCurrentTime = Math.max(0, event.payload.currentTime);
+			}
+			if (typeof event.payload.totalTime === 'number') {
+				hifzTotalTime = Math.max(0, event.payload.totalTime);
+			}
+			if (typeof event.payload.message === 'string') {
+				hifzProgressMessage = event.payload.message;
+			}
+		});
+	}
+
+	/**
+	 * Applique la génération Hifz après confirmation utilisateur.
+	 *
+	 * @returns {Promise<void>} Résolution lorsque l'action est terminée.
+	 */
+	async function applyHifzRepetition(): Promise<void> {
+		if (!canApply) return;
+
+		const safeRepeatCount = normalizeRepeatCount(repeatCount, sequenceMode === 'linked' ? 1 : 2);
+		const safeSilenceMultiplier = normalizeSilenceBetweenRepetitionsMultiplier(
+			silenceBetweenRepetitionsMultiplier
+		);
+		const safeGroupSilenceMultiplier = normalizeSilenceBetweenRepetitionsMultiplier(
+			silenceBetweenGroupsMultiplier
+		);
+		const effectiveExtendCompleteSubtitlesAcrossRepetitions =
+			(safeSilenceMultiplier > 0 || safeGroupSilenceMultiplier > 0) && !showSubtitlesDuringPause
+				? false
+				: extendCompleteSubtitlesAcrossRepetitions;
+		const confirmed = await ModalManager.confirmModal(
+			get(LL).tools.hifzConfirmationMessage(),
+			true
+		);
+		if (!confirmed) return;
+
+		isRunning = true;
+		errorMessage = null;
+		hifzProgress = 0;
+		hifzCurrentTime = 0;
+		hifzTotalTime = 0;
+		hifzProgressMessage = get(LL).tools.generatingHifzAudio();
+		const unlistenProgress = await listenHifzProgress();
+		const result = await applyHifzRepetitionToProject(
+			safeRepeatCount,
+			repeatTarget,
+			preserveVisualMerges,
+			safeSilenceMultiplier,
+			showSubtitlesDuringPause,
+			effectiveExtendCompleteSubtitlesAcrossRepetitions,
+			{
+				mode: sequenceMode,
+				linkedBlockSize: normalizeRepeatCount(linkedBlockSize),
+				linkedRepeatCount: normalizeRepeatCount(linkedRepeatCount),
+				firstLastRepeatCount: normalizeRepeatCount(firstLastRepeatCount),
+				includeFullSequenceAtStart,
+				includeFullSequenceAtEnd,
+				silenceBetweenGroupsMultiplier: safeGroupSilenceMultiplier
+			},
+			repeatedSourceIds
+		).finally(() => {
+			unlistenProgress();
+			isRunning = false;
+		});
+
+		if (result.status === 'failed') {
+			errorMessage = result.message;
+			toast.error(result.message);
+			return;
+		}
+
+		toast.success(get(LL).tools.hifzTrackGenerated({ count: result.subtitleCount }));
+		close();
+	}
+</script>
+
+<div
+	class="bg-secondary border-color border rounded-2xl w-[540px] max-w-[90vw] max-h-[710px] shadow-2xl shadow-black flex flex-col relative overflow-hidden"
+	transition:slide
+>
+	<div class="bg-gradient-to-r from-accent to-bg-accent px-6 py-4 border-b border-color shrink-0">
+		<div class="flex items-center justify-between">
+			<div class="flex items-center gap-3">
+				<div class="w-8 h-8 bg-accent-primary rounded-full flex items-center justify-center">
+					<span class="material-icons text-black text-lg">repeat</span>
+				</div>
+				<div>
+					<h2 class="text-xl font-bold text-primary">{$LL.tools.hifzRepetition()}</h2>
+					<p class="text-sm text-thirdly">{$LL.tools.hifzDescription()}</p>
+				</div>
+			</div>
+
+			<button
+				class="w-8 h-8 rounded-full hover:bg-[rgba(255,255,255,0.1)] flex items-center justify-center transition-all duration-200 text-secondary hover:text-primary cursor-pointer"
+				onclick={close}
+			>
+				<span class="material-icons text-lg">close</span>
+			</button>
+		</div>
+	</div>
+
+	<div class="px-6 py-5 space-y-5 overflow-y-auto min-h-0">
+		<p class="text-sm text-secondary leading-relaxed">
+			{$LL.tools.hifzBody()}
+		</p>
+
+		<div class="grid grid-cols-2 gap-3">
+			<button
+				type="button"
+				class="flex flex-col items-center justify-center gap-2 p-4 rounded-xl border transition-all duration-200 cursor-pointer {sequenceMode ===
+				'standard'
+					? 'bg-accent-primary text-black border-accent-primary shadow-lg shadow-accent-primary/20'
+					: 'bg-accent border-color text-secondary hover:bg-secondary/60'}"
+				onclick={() => {
+					sequenceMode = 'standard';
+					repeatCount = normalizeRepeatCount(repeatCount, 2);
+				}}
+			>
+				<span class="material-icons">repeat</span>
+				<span class="text-sm font-medium">
+					{hifzText.standardSequence()}
+					<span
+						class="material-icons align-middle text-[16px]! cursor-help"
+						title={hifzText.standardSequenceHelp()}>help</span
+					>
+				</span>
+			</button>
+			<button
+				type="button"
+				class="flex flex-col items-center justify-center gap-2 p-4 rounded-xl border transition-all duration-200 cursor-pointer {sequenceMode ===
+				'linked'
+					? 'bg-accent-primary text-black border-accent-primary shadow-lg shadow-accent-primary/20'
+					: 'bg-accent border-color text-secondary hover:bg-secondary/60'}"
+				onclick={() => {
+					sequenceMode = 'linked';
+					repeatCount = 1;
+				}}
+			>
+				<span class="material-icons">link</span>
+				<span class="text-sm font-medium">
+					{hifzText.linkedSequence()}
+					<span
+						class="material-icons align-middle text-[16px]! cursor-help"
+						title={hifzText.linkedSequenceDescription()}>help</span
+					>
+				</span>
+			</button>
+		</div>
+
+		{#if sequenceMode === 'linked'}
+			<p class="text-xs text-thirdly leading-relaxed">{hifzText.linkedSequenceDescription()}</p>
+		{/if}
+
+		<div class="grid grid-cols-2 gap-3">
+			<button
+				type="button"
+				class="flex flex-col items-center justify-center gap-2 p-4 rounded-xl border transition-all duration-200 cursor-pointer {repeatTarget ===
+				'verse'
+					? 'bg-accent-primary text-black border-accent-primary shadow-lg shadow-accent-primary/20'
+					: 'bg-accent border-color text-secondary hover:bg-secondary/60'}"
+				onclick={() => (repeatTarget = 'verse')}
+			>
+				<span class="material-icons">menu_book</span>
+				<span class="text-sm font-medium">{$LL.tools.repeatEachVerse()}</span>
+			</button>
+			<button
+				type="button"
+				class="flex flex-col items-center justify-center gap-2 p-4 rounded-xl border transition-all duration-200 cursor-pointer {repeatTarget ===
+				'subtitle'
+					? 'bg-accent-primary text-black border-accent-primary shadow-lg shadow-accent-primary/20'
+					: 'bg-accent border-color text-secondary hover:bg-secondary/60'}"
+				onclick={() => (repeatTarget = 'subtitle')}
+			>
+				<span class="material-icons">subtitles</span>
+				<span class="text-sm font-medium">{$LL.tools.repeatEachSubtitle()}</span>
+			</button>
+		</div>
+
+		{#if isRunning}
+			<div class="rounded-xl border border-color bg-accent/50 p-4 space-y-3">
+				<div class="flex items-center justify-between gap-3 text-xs">
+					<span class="text-secondary"
+						>{hifzProgressMessage || $LL.tools.generatingHifzAudio()}</span
+					>
+					<span class="font-semibold text-primary">{Math.round(hifzProgress)}%</span>
+				</div>
+				<div class="h-2 overflow-hidden rounded-full bg-secondary">
+					<div
+						class="h-full rounded-full bg-accent-primary transition-all duration-300"
+						style={`width: ${hifzProgress}%;`}
+					></div>
+				</div>
+				<div class="flex justify-between text-xs text-thirdly">
+					<span>{formatProgressTime(hifzCurrentTime)}</span>
+					<span>{formatProgressTime(hifzTotalTime)}</span>
+				</div>
+			</div>
+		{/if}
+
+		{#if errorMessage}
+			<div
+				class="rounded-xl border border-danger-color bg-danger-color/10 px-4 py-3 text-sm text-danger-color"
+			>
+				{errorMessage}
+			</div>
+		{/if}
+
+		<div class="space-y-2">
+			<label for="hifz-repeat-count" class="text-sm font-medium text-primary block">
+				{sequenceMode === 'linked' ? hifzText.individualRepeatCount() : $LL.tools.repeatCount()}
+				{#if sequenceMode === 'linked'}
+					<span
+						class="material-icons align-middle text-[16px]! text-thirdly cursor-help"
+						title={hifzText.individualRepeatCountHelp()}>help</span
+					>
+				{/if}
+			</label>
+			<input
+				id="hifz-repeat-count"
+				type="number"
+				min={sequenceMode === 'linked' ? 1 : 2}
+				max="50"
+				step="1"
+				value={repeatCount}
+				oninput={(event) => setRepeatCount(Number((event.currentTarget as HTMLInputElement).value))}
+				class="w-full bg-accent border border-color rounded-lg px-3 py-2 text-primary focus:border-accent-primary focus:outline-none transition-colors"
+			/>
+		</div>
+
+		{#if sequenceMode === 'linked'}
+			<div class="grid grid-cols-3 gap-3">
+				<div class="space-y-2">
+					<label for="hifz-edge-repeat-count" class="text-xs font-medium text-primary block">
+						{hifzText.firstLastRepeatCount()}
+						<span
+							class="material-icons align-middle text-[16px]! text-thirdly cursor-help"
+							title={hifzText.firstLastRepeatCountHelp()}>help</span
+						>
+					</label>
+					<input
+						id="hifz-edge-repeat-count"
+						type="number"
+						min="1"
+						max="50"
+						step="1"
+						value={firstLastRepeatCount}
+						oninput={(event) =>
+							(firstLastRepeatCount = normalizeRepeatCount(
+								Number((event.currentTarget as HTMLInputElement).value)
+							))}
+						class="w-full bg-accent border border-color rounded-lg px-3 py-2 text-primary focus:border-accent-primary focus:outline-none transition-colors"
+					/>
+				</div>
+				<div class="space-y-2">
+					<label for="hifz-linked-block-size" class="text-xs font-medium text-primary block">
+						{hifzText.linkedBlockSize()}
+						<span
+							class="material-icons align-middle text-[16px]! text-thirdly cursor-help"
+							title={hifzText.linkedBlockSizeHelp()}>help</span
+						>
+					</label>
+					<input
+						id="hifz-linked-block-size"
+						type="number"
+						min="2"
+						max="10"
+						step="1"
+						value={linkedBlockSize}
+						oninput={(event) =>
+							(linkedBlockSize = normalizeRepeatCount(
+								Number((event.currentTarget as HTMLInputElement).value),
+								2
+							))}
+						class="w-full bg-accent border border-color rounded-lg px-3 py-2 text-primary focus:border-accent-primary focus:outline-none transition-colors"
+					/>
+				</div>
+				<div class="space-y-2">
+					<label for="hifz-linked-repeat-count" class="text-xs font-medium text-primary block">
+						{hifzText.linkedRepeatCount()}
+						<span
+							class="material-icons align-middle text-[16px]! text-thirdly cursor-help"
+							title={hifzText.linkedRepeatCountHelp()}>help</span
+						>
+					</label>
+					<input
+						id="hifz-linked-repeat-count"
+						type="number"
+						min="1"
+						max="50"
+						step="1"
+						value={linkedRepeatCount}
+						oninput={(event) =>
+							(linkedRepeatCount = normalizeRepeatCount(
+								Number((event.currentTarget as HTMLInputElement).value)
+							))}
+						class="w-full bg-accent border border-color rounded-lg px-3 py-2 text-primary focus:border-accent-primary focus:outline-none transition-colors"
+					/>
+				</div>
+			</div>
+
+			<div class="grid grid-cols-2 gap-3">
+				<label class="flex items-center gap-3 text-sm text-secondary">
+					<input
+						type="checkbox"
+						checked={includeFullSequenceAtStart}
+						onchange={(event) =>
+							(includeFullSequenceAtStart = (event.currentTarget as HTMLInputElement).checked)}
+						class="accent-accent-primary"
+					/>
+					<span>
+						{hifzText.playFullAtStart()}
+						<span
+							class="material-icons align-middle text-[16px]! text-thirdly cursor-help"
+							title={hifzText.playFullAtStartHelp()}>help</span
+						>
+					</span>
+				</label>
+				<label class="flex items-center gap-3 text-sm text-secondary">
+					<input
+						type="checkbox"
+						checked={includeFullSequenceAtEnd}
+						onchange={(event) =>
+							(includeFullSequenceAtEnd = (event.currentTarget as HTMLInputElement).checked)}
+						class="accent-accent-primary"
+					/>
+					<span>
+						{hifzText.playFullAtEnd()}
+						<span
+							class="material-icons align-middle text-[16px]! text-thirdly cursor-help"
+							title={hifzText.playFullAtEndHelp()}>help</span
+						>
+					</span>
+				</label>
+			</div>
+		{/if}
+
+		<div class="grid grid-cols-2 gap-3">
+			<div class="space-y-2">
+				<label for="hifz-silence-multiplier" class="text-sm font-medium text-primary block">
+					{hifzText.pauseBetweenRepeats()}
+					<span
+						class="material-icons align-middle text-[16px]! text-thirdly cursor-help"
+						title={hifzText.pauseBetweenRepeatsHelp()}>help</span
+					>
+				</label>
+				<input
+					id="hifz-silence-multiplier"
+					type="number"
+					min="0"
+					max="3"
+					step="0.25"
+					value={silenceBetweenRepetitionsMultiplier}
+					oninput={(event) =>
+						setSilenceBetweenRepetitionsMultiplier(
+							Number((event.currentTarget as HTMLInputElement).value)
+						)}
+					class="w-full bg-accent border border-color rounded-lg px-3 py-2 text-primary focus:border-accent-primary focus:outline-none transition-colors"
+				/>
+			</div>
+			<div class="space-y-2">
+				<label for="hifz-group-silence-multiplier" class="text-sm font-medium text-primary block">
+					{hifzText.pauseBetweenGroups()}
+					<span
+						class="material-icons align-middle text-[16px]! text-thirdly cursor-help"
+						title={hifzText.pauseBetweenGroupsHelp()}>help</span
+					>
+				</label>
+				<input
+					id="hifz-group-silence-multiplier"
+					type="number"
+					min="0"
+					max="3"
+					step="0.25"
+					value={silenceBetweenGroupsMultiplier}
+					oninput={(event) =>
+						(silenceBetweenGroupsMultiplier = normalizeSilenceBetweenRepetitionsMultiplier(
+							Number((event.currentTarget as HTMLInputElement).value)
+						))}
+					class="w-full bg-accent border border-color rounded-lg px-3 py-2 text-primary focus:border-accent-primary focus:outline-none transition-colors"
+				/>
+			</div>
+		</div>
+		<div class="space-y-2 -mt-3">
+			<p class="text-xs text-thirdly leading-relaxed">
+				{$LL.tools.silenceDescription()}
+			</p>
+		</div>
+
+		<details class="rounded-xl border border-color bg-accent/40 p-3">
+			<summary class="cursor-pointer text-sm font-medium text-primary">
+				{hifzText.repetitionSelection()}
+				<span
+					class="material-icons align-middle text-[16px]! text-thirdly cursor-help"
+					title={hifzText.repetitionSelectionDescription()}>help</span
+				>
+			</summary>
+			<p class="mt-2 text-xs text-thirdly leading-relaxed">
+				{hifzText.repetitionSelectionDescription()}
+			</p>
+			<div class="mt-3 max-h-44 space-y-2 overflow-y-auto pr-1">
+				{#each summary.sources as source (source.id)}
+					<label
+						class="flex items-start gap-3 rounded-lg bg-secondary/50 px-3 py-2 text-sm text-secondary"
+					>
+						<input
+							type="checkbox"
+							checked={repeatedSourceIds.includes(source.id)}
+							onchange={(event) =>
+								setSourceRepeated(source.id, (event.currentTarget as HTMLInputElement).checked)}
+							class="mt-0.5 accent-accent-primary"
+						/>
+						<span class="min-w-0">
+							{#if source.kind === 'subtitle'}
+								<span class="font-medium text-primary">{source.surah}:{source.verse}</span>
+							{/if}
+							<span class="block truncate" dir="auto">{source.text}</span>
+						</span>
+					</label>
+				{/each}
+			</div>
+		</details>
+
+		<label class="flex items-center gap-3 text-sm text-secondary">
+			<input
+				type="checkbox"
+				checked={preserveVisualMerges}
+				onchange={(event) =>
+					(preserveVisualMerges = (event.currentTarget as HTMLInputElement).checked)}
+				class="accent-accent-primary"
+			/>
+			<span class="leading-relaxed">
+				<span class="block font-medium text-primary">
+					{$LL.tools.keepVisualMerges()}
+					<span
+						class="material-icons align-middle text-[16px]! text-thirdly cursor-help"
+						title="Preserves existing visual merge groups when they can be repeated safely. This keeps merged Arabic and translation layouts together instead of splitting them into separate subtitle blocks."
+						>help</span
+					>
+				</span>
+			</span>
+		</label>
+
+		{#if silenceBetweenRepetitionsMultiplier > 0 || silenceBetweenGroupsMultiplier > 0}
+			<label class="flex items-center gap-3 text-sm text-secondary">
+				<input
+					type="checkbox"
+					checked={showSubtitlesDuringPause}
+					onchange={(event) =>
+						setShowSubtitlesDuringPause((event.currentTarget as HTMLInputElement).checked)}
+					class="accent-accent-primary"
+				/>
+				<span class="leading-relaxed">
+					<span class="block font-medium text-primary">
+						{$LL.tools.keepSubtitlesVisible()}
+						<span
+							class="material-icons align-middle text-[16px]! text-thirdly cursor-help"
+							title="Extends each repeated subtitle so it stays visible during the pause right after it. Disable this if you want real empty gaps between repetitions."
+							>help</span
+						>
+					</span>
+				</span>
+			</label>
+		{/if}
+
+		{#if (silenceBetweenRepetitionsMultiplier === 0 && silenceBetweenGroupsMultiplier === 0) || showSubtitlesDuringPause}
+			<label class="flex items-center gap-3 text-sm text-secondary">
+				<input
+					type="checkbox"
+					checked={extendCompleteSubtitlesAcrossRepetitions}
+					onchange={(event) =>
+						(extendCompleteSubtitlesAcrossRepetitions = (event.currentTarget as HTMLInputElement)
+							.checked)}
+					class="accent-accent-primary"
+				/>
+				<span class="leading-relaxed">
+					<span class="block font-medium text-primary">
+						{$LL.tools.stretchCompleteSubtitles()}
+						<span
+							class="material-icons align-middle text-[16px]! text-thirdly cursor-help"
+							title="When a verse or subtitle is complete and can be merged safely, creates one long subtitle across the repeated cycle instead of recreating a new subtitle for each repetition. This does not apply to partial verses or multi-subtitle verse blocks."
+							>help</span
+						>
+					</span>
+				</span>
+			</label>
+		{/if}
+	</div>
+
+	<div class="border-t border-color bg-primary px-6 py-4 shrink-0">
+		<div class="flex items-center justify-between">
+			<div class="text-xs text-thirdly">
+				{#if summary.subtitleCount === 0}
+					{$LL.tools.addSubtitlesBeforeHifz()}
+				{:else if summary.audioClipCount === 0}
+					{$LL.tools.noAudioFoundSilentHifz()}
+				{:else}
+					{$LL.tools.readyToGenerate()}
+				{/if}
+			</div>
+			<div class="flex gap-3">
+				<button class="btn px-5 py-2 text-sm" onclick={close} disabled={isRunning}
+					>{$LL.common.cancel()}</button
+				>
+				<button
+					class="btn-accent px-5 py-2 text-sm flex items-center gap-2"
+					onclick={applyHifzRepetition}
+					disabled={!canApply}
+				>
+					<span class="material-icons text-base">{isRunning ? 'hourglass_empty' : 'done'}</span>
+					{isRunning ? $LL.tools.generating() : $LL.tools.generateHifz()}
+				</button>
+			</div>
+		</div>
+	</div>
+</div>

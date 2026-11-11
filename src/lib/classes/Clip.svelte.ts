@@ -1,0 +1,1265 @@
+import { globalState } from '$lib/runes/main.svelte';
+import LL from '$lib/i18n/i18n-svelte';
+import { get } from 'svelte/store';
+import toast from 'svelte-5-french-toast';
+import { Edition, Translation } from '.';
+import {
+	buildTranslationInlineTextSegments,
+	getInlineStyleFlagsForWordIndex,
+	getTranslationWordCount,
+	type TranslationInlineStyleFlags,
+	type TranslationInlineStyleRun,
+	type TranslationInlineTextSegment,
+	toggleTranslationInlineStyleRuns
+} from './Translation.svelte';
+import { SerializableBase } from './misc/SerializableBase';
+import { Utilities } from './misc/Utilities';
+import type { Track } from './Track.svelte';
+import type { Category, Style, StyleName } from './VideoStyle.svelte';
+import QPCFontProvider from '$lib/services/FontProvider';
+import MinimalQuranProvider from '$lib/services/MinimalQuranProvider';
+import IndopakQuranProvider from '$lib/services/IndopakQuranProvider';
+import RiwayahProvider, {
+	getRiwayahFontFamily,
+	isNonHafsRiwayah
+} from '$lib/services/RiwayahProvider';
+import type { SubtitleAlignmentMetadata } from '$lib/services/AutoSegmentation';
+import { ProjectHistoryManager } from '$lib/services/undoRedo/ProjectHistoryManager';
+import type { ProjectTranslation } from './ProjectTranslation.svelte';
+import {
+	getTimedOverlayRanges,
+	getTimedOverlayRangesFromStyles,
+	syncTimedOverlayLegacyRange,
+	updateTimedOverlayRange,
+	type TimedOverlayRange
+} from '$lib/services/TimedOverlayRanges';
+
+type ClipType =
+	| 'Silence'
+	| 'Pre-defined Subtitle'
+	| 'Subtitle'
+	| 'Custom Text'
+	| 'Custom Image'
+	| 'Asset';
+
+type ArabicRenderParts = {
+	text: string;
+	words?: string[];
+	sourceWordIndexes?: number[][];
+	suffix: string;
+	suffixFontFamily: string | null;
+};
+
+export type VisualMergeMode = 'arabic' | 'translation' | 'both';
+
+export class Clip extends SerializableBase {
+	id: number;
+	startTime: number = $state(0);
+	endTime: number = $state(0);
+	duration: number = $state(0);
+
+	type: ClipType;
+	showWaveform: boolean = $state(false);
+
+	constructor(startTime: number, endTime: number, type: ClipType) {
+		super();
+
+		this.id = Utilities.randomId();
+		this.startTime = startTime;
+		this.endTime = endTime;
+		this.duration = endTime - startTime;
+		this.type = type;
+	}
+
+	getWidth(): number {
+		const timelineZoom = globalState.currentProject?.projectEditorState.timeline.zoom ?? 0;
+		if (this.duration === 0) {
+			// C'est dans le cas où l'asset est une image. C'est alors l'image de fond de la vidéo.
+			// Elle prend la taille de la timeline.
+			const longestTrackDuration =
+				globalState.currentProject?.content.timeline.getLongestTrackDuration().toSeconds() ?? 0;
+			return longestTrackDuration * timelineZoom;
+		}
+
+		return (this.duration / 1000) * timelineZoom;
+	}
+
+	/**
+	 * Met à jour l'heure de début du clip tout en modifiant l'heure de fin du clip précédent pour éviter les chevauchements.
+	 * @param newStartTime La nouvelle heure de début.
+	 */
+	updateStartTime(newStartTime: number) {
+		// Vérification 1: Le clip actuel doit avoir au minimum 100ms de durée
+		const newCurrentClipDuration = this.endTime - newStartTime;
+		if (newCurrentClipDuration < 100) {
+			return;
+		}
+
+		// Met à jour la endTime du clip à sa gauche pour éviter les chevauchements
+		const track: Track = globalState.getSubtitleTrack;
+
+		const previousClip = track.getClipBefore(this.id);
+
+		if (previousClip && previousClip.id !== this.id) {
+			// Vérification 2: Le clip précédent doit avoir au minimum 100ms de durée
+			const newPreviousClipDuration = newStartTime - 1 - previousClip.startTime;
+
+			if (newPreviousClipDuration < 100) {
+				return;
+			}
+
+			previousClip.endTime = newStartTime - 1;
+			previousClip.duration = previousClip.endTime - previousClip.startTime;
+		}
+
+		this.setStartTime(newStartTime);
+	}
+
+	/**
+	 * Met à jour l'heure de fin du clip tout en modifiant l'heure de début du clip suivant pour éviter les chevauchements.
+	 * @param newEndTime La nouvelle heure de fin.
+	 */
+	updateEndTime(newEndTime: number) {
+		// Vérification 1: Le clip actuel doit avoir au minimum 100ms de durée
+		const newCurrentClipDuration = newEndTime - this.startTime;
+		if (newCurrentClipDuration < 100) {
+			return;
+		}
+
+		// Met à jour la startTime du clip à sa droite pour éviter les chevauchements
+		const track: Track = globalState.getSubtitleTrack;
+
+		const nextClip = track.getClipAfter(this.id);
+
+		if (nextClip && nextClip.id !== this.id) {
+			// Vérification 2: Le clip suivant doit avoir au minimum 100ms de durée
+			const newNextClipDuration = nextClip.endTime - (newEndTime + 1);
+
+			if (newNextClipDuration < 100) {
+				return;
+			}
+
+			// Met à jour le startTime du clip suivant
+			nextClip.setStartTime(newEndTime + 1);
+		}
+
+		this.setEndTime(newEndTime);
+	}
+
+	/**
+	 * Met à jour l'heure de début du clip et recalcule la durée.
+	 * @param newStartTime La nouvelle heure de début.
+	 */
+	setStartTime(newStartTime: number) {
+		ProjectHistoryManager.begin('set clip start');
+		try {
+			// Prévention pour pas que le clip est une durée négative
+			if (this.endTime < newStartTime) {
+				toast.error(get(LL).editor.clipLengthNegative());
+				return;
+			}
+
+			this.startTime = newStartTime;
+			this.duration = this.endTime - this.startTime;
+		} finally {
+			ProjectHistoryManager.commit();
+		}
+	}
+
+	/**
+	 * Met à jour l'heure de fin du clip et recalcule la durée.
+	 * @param newEndTime La nouvelle heure de fin.
+	 */
+	setEndTime(newEndTime: number) {
+		ProjectHistoryManager.begin('set clip end');
+		try {
+			// Prévention pour pas que le clip est une durée négative
+			if (newEndTime < this.startTime) {
+				toast.error(get(LL).editor.clipLengthNegative());
+				return;
+			}
+
+			this.endTime = newEndTime;
+			this.duration = this.endTime - this.startTime;
+		} finally {
+			ProjectHistoryManager.commit();
+		}
+	}
+}
+
+export class AssetClip extends Clip {
+	assetId: number = $state(0);
+	animateImageZoom: boolean = $state(false);
+	imageZoomEnd: number = $state(1.5);
+	loopUntilAudioEnd: boolean = $state(false);
+	sourceStartTime: number = $state(0);
+	volumePercent: number = $state(100);
+
+	constructor(startTime: number, endTime: number, assetId: number) {
+		super(startTime, endTime, 'Asset');
+		this.assetId = assetId;
+	}
+
+	/**
+	 * Calcule le zoom progressif de l'image sur sa durée visible.
+	 * @param {number} timeMs Position courante sur la timeline.
+	 * @param {number} startMs Début visible du clip.
+	 * @param {number} durationMs Durée visible, y compris pour une image de fond sans durée.
+	 * @returns {number} Facteur de zoom entre 1 et la valeur finale choisie.
+	 */
+	getImageZoomScale(timeMs: number, startMs: number, durationMs: number): number {
+		if (!this.animateImageZoom || durationMs <= 0) return 1;
+		return (
+			1 +
+			(Math.min(3, Math.max(1, this.imageZoomEnd)) - 1) *
+				Math.min(1, Math.max(0, (timeMs - startMs) / durationMs))
+		);
+	}
+}
+
+export class ClipWithTranslation extends Clip {
+	hasBeenVerified: boolean = $state(false);
+	translations: { [key: string]: Translation } = $state({});
+	text: string = $state('');
+	arabicInlineStyleRuns: TranslationInlineStyleRun[] = $state([]);
+	associatedImagePath: string | null = $state(null);
+	needsLongReview: boolean = $state(false); // Vrai si le segment a été marqué comme trop long.
+	needsWbwTimestampReview: boolean = $state(false); // Vrai si le segment n'a pas de timestamps WBW.
+	comeFromIA: boolean = $state(false);
+	confidence: number | null = $state(null); // Entre 0 et 1
+	needsReview: boolean = $state(false); // Vrai si c'est un segment à low-confidence et qu'il n'a pas encore été reviewé
+	needsCoverageReview: boolean = $state(false); // Vrai si des lacunes de couverture sont détectées
+
+	constructor(
+		text: string,
+		startTime: number,
+		endTime: number,
+		type: ClipType,
+		translations: { [key: string]: Translation } = {},
+		comeFromIA: boolean = false,
+		confidence: number | null = null
+	) {
+		super(startTime, endTime, type);
+		this.translations = translations;
+		this.text = text;
+		this.comeFromIA = comeFromIA;
+		this.confidence = comeFromIA ? confidence : null;
+		// Le segment est marqué comme besoin de review si c'est un segment IA et qu'il a une confiance inférieure à 75%
+		this.needsReview = comeFromIA && confidence !== null && confidence <= 0.75;
+	}
+
+	/**
+	 * Deserialise un clip en reconstruisant les traductions sauvegardées dans
+	 * l'ancien format où le dictionnaire entier était enregistré comme une traduction.
+	 *
+	 * @param {Record<string, unknown>} data Données sérialisées du clip.
+	 * @returns {ClipWithTranslation} Clip désérialisé avec des traductions réhydratées.
+	 */
+	static override fromJSON<T extends SerializableBase>(data: Record<string, unknown>): T {
+		const clip = super.fromJSON(data) as T & ClipWithTranslation;
+		const translations = clip.translations as unknown as Translation;
+
+		if (
+			translations instanceof Translation &&
+			translations.text === undefined &&
+			translations.status === undefined
+		) {
+			clip.translations = Object.fromEntries(
+				Object.entries(translations)
+					.filter(([, value]) => value && typeof value === 'object')
+					.map(([editionName, translation]) => [
+						editionName,
+						translation instanceof Translation
+							? translation
+							: Translation.fromJSON(translation as Record<string, unknown>)
+					])
+			) as { [key: string]: Translation };
+		}
+
+		return clip as T;
+	}
+
+	markAsManualEdit() {
+		this.comeFromIA = false;
+		this.confidence = null;
+		this.needsReview = false; // Le segment n'a plus besoin de review de confiance
+		this.needsCoverageReview = false; // Le segment n'a plus besoin de review de couverture
+		this.needsLongReview = false;
+		this.hasBeenVerified = false;
+	}
+
+	/**
+	 * Retourne la traduction associée à l'édition spécifiée.
+	 * @param edition L'édition pour laquelle obtenir la traduction.
+	 * @return La traduction associée à l'édition.
+	 */
+	getTranslation(edition: Edition | string): Translation {
+		return this.translations[typeof edition === 'string' ? edition : edition.name];
+	}
+
+	getText(): string {
+		return this.text;
+	}
+
+	/**
+	 * Retourne les parties du texte arabe à afficher.
+	 * Par défaut, les clips texte simples utilisent toujours `this.text`.
+	 * `SubtitleClip` override cette méthode pour gérer les rendus Quran/QPC/IndoPak.
+	 */
+	getArabicRenderParts(_mode: 'editor' | 'preview' = 'editor'): ArabicRenderParts {
+		return {
+			text: this.text,
+			suffix: '',
+			suffixFontFamily: null
+		};
+	}
+
+	clearArabicInlineStyles(): void {
+		this.arabicInlineStyleRuns = [];
+	}
+
+	/**
+	 * Toggle les styles inline sur une plage de mots du texte arabe.
+	 * Les indexes sont toujours basés sur le texte source stocké dans `this.text`.
+	 */
+	toggleArabicInlineStyles(
+		startWordIndex: number,
+		endWordIndex: number,
+		flags: TranslationInlineStyleFlags
+	): void {
+		this.arabicInlineStyleRuns = toggleTranslationInlineStyleRuns(
+			this.arabicInlineStyleRuns ?? [],
+			getTranslationWordCount(this.text),
+			startWordIndex,
+			endWordIndex,
+			flags
+		);
+	}
+
+	/**
+	 * Construit les segments stylés du texte arabe, sans inclure d'éventuel suffixe
+	 * comme un numéro de verset.
+	 */
+	getArabicInlineStyledSegments(
+		mode: 'editor' | 'preview' = 'editor'
+	): TranslationInlineTextSegment[] {
+		const parts = this.getArabicRenderParts(mode);
+		if (parts.words && parts.sourceWordIndexes) {
+			return parts.words.map((word, index) => {
+				const flags = parts
+					.sourceWordIndexes![index].map(
+						(sourceWordIndex) =>
+							sourceWordIndex - (this instanceof SubtitleClip ? this.startWordIndex : 0)
+					)
+					.filter((sourceWordIndex) => sourceWordIndex >= 0)
+					.reduce(
+						(merged, sourceWordIndex) => {
+							const sourceFlags = getInlineStyleFlagsForWordIndex(
+								this.arabicInlineStyleRuns ?? [],
+								sourceWordIndex
+							);
+							return {
+								bold: merged.bold || sourceFlags.bold,
+								italic: merged.italic || sourceFlags.italic,
+								underline: merged.underline || sourceFlags.underline,
+								lineBreak: merged.lineBreak || sourceFlags.lineBreak,
+								color: sourceFlags.color ?? merged.color,
+								glow: sourceFlags.glow ?? merged.glow
+							};
+						},
+						{
+							bold: false,
+							italic: false,
+							underline: false,
+							lineBreak: false,
+							color: null,
+							glow: null
+						} as TranslationInlineStyleFlags
+					);
+				return { text: `${index > 0 ? ' ' : ''}${word}`, ...flags };
+			});
+		}
+		return buildTranslationInlineTextSegments(parts.text, this.arabicInlineStyleRuns ?? []);
+	}
+
+	getAssociatedImagePath(): string | null {
+		return this.associatedImagePath;
+	}
+
+	hasAssociatedImage(): boolean {
+		return !!this.associatedImagePath;
+	}
+
+	setAssociatedImagePath(path: string | null): void {
+		ProjectHistoryManager.track('set linked image', () => {
+			this.associatedImagePath = path;
+		});
+	}
+}
+
+export type ReviewIssueCategory = 'coverage' | 'wbw-timestamps' | 'long' | 'low-confidence';
+
+/**
+ * Retourne `true` si le clip porte au moins un indicateur de revue actif.
+ *
+ * @param {ClipWithTranslation | null | undefined} clip Clip a inspecter.
+ * @returns {boolean} `true` si le clip doit etre considere comme reviewable.
+ */
+export function hasClipReviewIssue(clip: ClipWithTranslation | null | undefined): boolean {
+	return (
+		!!clip &&
+		(clip.needsCoverageReview ||
+			clip.needsWbwTimestampReview ||
+			clip.needsLongReview ||
+			clip.needsReview)
+	);
+}
+
+/**
+ * Retourne la categorie principale de review d'un clip.
+ *
+ * @param {ClipWithTranslation | null | undefined} clip Clip a inspecter.
+ * @returns {ReviewIssueCategory | null} Categorie principale ou `null`.
+ */
+export function getClipPrimaryReviewIssueCategory(
+	clip: ClipWithTranslation | null | undefined
+): ReviewIssueCategory | null {
+	if (!clip) return null;
+	if (clip.needsCoverageReview) return 'coverage';
+	if (clip.needsReview) return 'low-confidence';
+	if (clip.needsLongReview) return 'long';
+	if (clip.needsWbwTimestampReview) return 'wbw-timestamps';
+	return null;
+}
+
+/**
+ * Retourne `true` si le clip a encore besoin d'une verification explicite.
+ *
+ * @param {ClipWithTranslation | null | undefined} clip Clip a inspecter.
+ * @returns {boolean} `true` si le clip est signale et non encore verifie.
+ */
+export function isClipPendingVerification(clip: ClipWithTranslation | null | undefined): boolean {
+	return !!clip && hasClipReviewIssue(clip) && clip.hasBeenVerified !== true;
+}
+
+/**
+ * Marque un clip comme verifie s'il porte encore au moins un signal de revue.
+ *
+ * @param {ClipWithTranslation | null | undefined} clip Clip a mettre a jour.
+ * @returns {void}
+ */
+export function markClipAsVerified(clip: ClipWithTranslation | null | undefined): void {
+	if (!clip || !hasClipReviewIssue(clip)) return;
+	clip.hasBeenVerified = true;
+}
+
+export class SubtitleClip extends ClipWithTranslation {
+	static override __ignoredProperties = ['indopakText', 'isHydratingIndopakText'] as const;
+	surah: number;
+	verse: number;
+	startWordIndex: number;
+	endWordIndex: number;
+	alignmentMetadata: SubtitleAlignmentMetadata | null = $state(null);
+	// Vrai si l'utilisateur a édité manuellement les timings WBW (protège du re-MFA automatique).
+	wbwTimestampsManuallyEdited: boolean = $state(false);
+	visualMergeGroupId: string | null = $state(null);
+	visualMergeMode: VisualMergeMode | null = $state(null);
+	wbwTranslation: string[]; // Traduction mot à mot
+	isFullVerse: boolean; // Indique si ce clip contient l'intégralité du verset
+	isLastWordsOfVerse: boolean; // Indique si ce clip contient les derniers mots du verset
+
+	constructor(
+		startTime: number,
+		endTime: number,
+		surah: number,
+		verse: number,
+		startWordIndex: number,
+		endWordIndex: number,
+		text: string,
+		wbwTranslation: string[],
+		isFullVerse: boolean,
+		isLastWordsOfVerse: boolean,
+		translations: { [key: string]: Translation } = {},
+		comeFromIA: boolean = false,
+		confidence: number | null = null
+	) {
+		super(text, startTime, endTime, 'Subtitle', translations, comeFromIA, confidence);
+		this.surah = $state(surah);
+		this.verse = $state(verse);
+		this.startWordIndex = $state(startWordIndex);
+		this.endWordIndex = $state(endWordIndex);
+		this.translations = translations;
+		this.wbwTranslation = $state(wbwTranslation);
+		this.isFullVerse = $state(isFullVerse);
+		this.isLastWordsOfVerse = $state(isLastWordsOfVerse);
+	}
+
+	/**
+	 * Invalide les métadonnées d'alignement quand le clip devient manuel.
+	 */
+	override markAsManualEdit() {
+		super.markAsManualEdit();
+		// Un changement de contenu (texte/plage de mots) invalide une éventuelle édition manuelle WBW.
+		this.wbwTimestampsManuallyEdited = false;
+		if (!this.alignmentMetadata) return;
+
+		this.alignmentMetadata = null;
+		const currentContext = globalState.getSubtitlesEditorState.segmentationContext;
+		globalState.getSubtitlesEditorState.segmentationContext = {
+			...currentContext,
+			audioId: null,
+			alignedSegments: []
+		};
+	}
+
+	/**
+	 * Associe ce clip a un groupe de merge visuel.
+	 * @param {string} groupId Identifiant du groupe.
+	 * @param {VisualMergeMode} mode Mode de merge applique.
+	 * @returns {void}
+	 */
+	setVisualMerge(groupId: string, mode: VisualMergeMode): void {
+		this.visualMergeGroupId = groupId;
+		this.visualMergeMode = mode;
+	}
+
+	/**
+	 * Retire le merge visuel de ce clip.
+	 * @returns {void}
+	 */
+	clearVisualMerge(): void {
+		this.visualMergeGroupId = null;
+		this.visualMergeMode = null;
+	}
+
+	/**
+	 * Indique si le clip appartient a un groupe de merge visuel.
+	 * @returns {boolean} `true` si le clip est merge visuellement.
+	 */
+	isVisuallyMerged(): boolean {
+		return !!this.visualMergeGroupId && !!this.visualMergeMode;
+	}
+
+	/**
+	 * Retourne la clé du verset au format "Surah:Verse".
+	 * @returns La clé du verset.
+	 */
+	getVerseKey(): string {
+		return `${this.surah}:${this.verse}`;
+	}
+
+	/**
+	 * Retourne la valeur effective d'un style arabe pour ce sous-titre.
+	 * @param {StyleName} styleId Identifiant du style à résoudre.
+	 * @returns {string | number | boolean} Valeur locale ou globale du style.
+	 */
+	private getEffectiveArabicStyleValue(styleId: StyleName): string | number | boolean {
+		return (globalState.currentProject?.content.videoStyle
+			.getStylesOfTarget('arabic')
+			.getEffectiveValue(styleId, this.id) ??
+			globalState.getStyle('arabic', styleId)?.value ??
+			'') as string | number | boolean;
+	}
+
+	/**
+	 * Retourne le numéro de verset adapté au mushaf actif pour la traduction.
+	 * @param {'before' | 'after'} position Position configurée du numéro.
+	 * @returns {number | string | null | undefined} Numéro ou plage à afficher, ou aucune valeur quand il doit être masqué ou chargé.
+	 */
+	getTranslationVerseNumber(position: 'before' | 'after'): number | string | null | undefined {
+		const riwayah = this.getEffectiveArabicStyleValue('riwayah');
+		return isNonHafsRiwayah(riwayah)
+			? RiwayahProvider.getTranslationVerseNumber(riwayah, this.surah, this.verse, position)
+			: this.verse;
+	}
+
+	getTextWithVerseNumber(text: string = this.text): string {
+		if (this.isLastWordsOfVerse) {
+			const mushafStyle = globalState.getStyle('arabic', 'mushaf-style')?.value;
+			// Indopak may lack the ornamental verse-number glyph,
+			// so the number is rendered with Hafs in a nested span.
+			if (mushafStyle === 'Indopak')
+				return `<span style="direction: rtl; unicode-bidi: isolate;">${text} <span style="font-family:Hafs;">${this.latinToArabicNumbers(this.verse)}</span></span>`;
+			else return text + ` ${this.latinToArabicNumbers(this.verse)}`;
+		}
+		return text;
+	}
+
+	private latinToArabicNumbers(n: number): string {
+		return n.toString().replace(/\d/g, (digit) => {
+			const arabicDigits = ['٠', '١', '٢', '٣', '٤', '٥', '٦', '٧', '٨', '٩'];
+			return arabicDigits[parseInt(digit, 10)];
+		});
+	}
+
+	/**
+	 * Retourne les parties du texte arabe à afficher.
+	 * - `editor`: toujours le texte Uthmani brut du segment
+	 * - `preview`: respecte la police arabe active (QPC, Indopak, etc.)
+	 *
+	 * Le numéro de verset est renvoyé à part pour éviter de lui appliquer les styles inline.
+	 */
+	getArabicRenderParts(mode: 'editor' | 'preview' = 'editor'): ArabicRenderParts {
+		const verseNumbersEnabled = Boolean(globalState.getStyle('arabic', 'show-verse-number').value);
+		const showVerseNumber = this.isLastWordsOfVerse && verseNumbersEnabled;
+
+		if (mode === 'editor') {
+			return {
+				text: this.text,
+				suffix: showVerseNumber ? ` ${this.latinToArabicNumbers(this.verse)}` : '',
+				suffixFontFamily: null
+			};
+		}
+
+		const fontFamily = String(
+			globalState.currentProject?.content.videoStyle
+				.getStylesOfTarget('arabic')
+				.getEffectiveValue('font-family', this.id) ??
+				globalState.getStyle('arabic', 'font-family')?.value ??
+				''
+		);
+		const mushafStyle = String(globalState.getStyle('arabic', 'mushaf-style')?.value ?? 'Uthmani');
+		const riwayah = this.getEffectiveArabicStyleValue('riwayah');
+		if (isNonHafsRiwayah(riwayah)) {
+			const riwayahSlice = RiwayahProvider.getVerseSlice(
+				riwayah,
+				this.surah,
+				this.verse,
+				this.startWordIndex,
+				this.endWordIndex,
+				verseNumbersEnabled
+			);
+			if (riwayahSlice) {
+				return {
+					text: riwayahSlice.text,
+					words: riwayahSlice.words,
+					sourceWordIndexes: riwayahSlice.sourceWordIndexes,
+					suffix: riwayahSlice.suffix,
+					suffixFontFamily: riwayahSlice.suffix ? getRiwayahFontFamily(riwayah) : null
+				};
+			}
+		}
+
+		if (mushafStyle === 'Minimal Quran') {
+			const words =
+				MinimalQuranProvider.getVerseWordsSlice(
+					this.surah,
+					this.verse,
+					this.startWordIndex,
+					this.endWordIndex
+				) ?? undefined;
+			return {
+				text: words?.join(' ') ?? this.text,
+				words,
+				suffix: showVerseNumber ? ` ${this.latinToArabicNumbers(this.verse)}` : '',
+				suffixFontFamily: null
+			};
+		}
+
+		const shouldUseQpcGlyphs =
+			mushafStyle === 'Tajweed' || fontFamily === 'QPC1' || fontFamily === 'QPC2';
+
+		if (!shouldUseQpcGlyphs) {
+			const indopakWords =
+				mushafStyle === 'Indopak'
+					? (IndopakQuranProvider.getVerseWordsSlice(
+							this.surah,
+							this.verse,
+							this.startWordIndex,
+							this.endWordIndex
+						) ?? undefined)
+					: undefined;
+
+			return {
+				text: indopakWords?.join(' ') ?? this.text,
+				words: indopakWords,
+				suffix: showVerseNumber ? ` ${this.latinToArabicNumbers(this.verse)}` : '',
+				// En mode IndoPak, le numéro de verset reste rendu avec Hafs comme avant.
+				suffixFontFamily: showVerseNumber && mushafStyle === 'Indopak' ? 'Hafs' : null
+			};
+		}
+
+		const qpcVersion: '1' | '2' =
+			mushafStyle === 'Tajweed' ? '2' : fontFamily === 'QPC1' ? '1' : '2';
+
+		const words = QPCFontProvider.getQuranVerseGlyphWords(
+			this.surah,
+			this.verse,
+			this.startWordIndex,
+			this.endWordIndex,
+			qpcVersion
+		);
+
+		return {
+			text: words.join(' '),
+			words,
+			suffix: showVerseNumber
+				? ` ${QPCFontProvider.getQuranVerseGlyph(
+						this.surah,
+						this.verse,
+						this.endWordIndex + 1,
+						this.endWordIndex,
+						true,
+						qpcVersion
+					)}`.trimEnd()
+				: '',
+			suffixFontFamily: null
+		};
+	}
+
+	override getText(): string {
+		// En fonction de la police d'écriture, renvoie le bon texte
+		const fontFamily = String(
+			globalState.currentProject?.content.videoStyle
+				.getStylesOfTarget('arabic')
+				.getEffectiveValue('font-family', this.id) ??
+				globalState.getStyle('arabic', 'font-family')?.value ??
+				''
+		);
+		const mushafStyle = String(globalState.getStyle('arabic', 'mushaf-style')?.value ?? 'Uthmani');
+		const riwayah = this.getEffectiveArabicStyleValue('riwayah');
+		if (isNonHafsRiwayah(riwayah)) {
+			const showVerseNumbers = Boolean(globalState.getStyle('arabic', 'show-verse-number').value);
+			const riwayahSlice = RiwayahProvider.getVerseSlice(
+				riwayah,
+				this.surah,
+				this.verse,
+				this.startWordIndex,
+				this.endWordIndex,
+				showVerseNumbers
+			);
+			if (riwayahSlice) return riwayahSlice.text + riwayahSlice.suffix;
+			return showVerseNumbers ? this.getTextWithVerseNumber(this.text) : this.text;
+		}
+
+		if (mushafStyle === 'Minimal Quran') {
+			const minimalText =
+				MinimalQuranProvider.getVerseSlice(
+					this.surah,
+					this.verse,
+					this.startWordIndex,
+					this.endWordIndex
+				) ?? this.text;
+			return globalState.getStyle('arabic', 'show-verse-number').value
+				? this.getTextWithVerseNumber(minimalText)
+				: minimalText;
+		}
+
+		// Les polices QPC1, QPC2 et Tajweed utilisent des glyphes. Tajweed utilise les glyphes de QPC2.
+		const shouldUseQpcGlyphs =
+			mushafStyle === 'Tajweed' || fontFamily === 'QPC1' || fontFamily === 'QPC2';
+
+		if (!shouldUseQpcGlyphs) {
+			const baseText =
+				mushafStyle === 'Indopak'
+					? (IndopakQuranProvider.getVerseSlice(
+							this.surah,
+							this.verse,
+							this.startWordIndex,
+							this.endWordIndex
+						) ?? this.text)
+					: this.text;
+
+			if (globalState.getStyle('arabic', 'show-verse-number').value)
+				return this.getTextWithVerseNumber(baseText);
+			else return baseText;
+		}
+
+		// Tajweed utilise les glyphes de QPC2
+		const qpcVersion: '1' | '2' =
+			mushafStyle === 'Tajweed' ? '2' : fontFamily === 'QPC1' ? '1' : '2';
+
+		return QPCFontProvider.getQuranVerseGlyph(
+			this.surah,
+			this.verse,
+			this.startWordIndex,
+			this.endWordIndex,
+			this.isLastWordsOfVerse,
+			qpcVersion
+		);
+	}
+
+	/**
+	 * Normalise les timings WBW pour qu'ils restent dans la durée du clip.
+	 * @param {SubtitleAlignmentMetadata['words']} words Timings WBW à normaliser.
+	 * @param {number} clipDurationS Durée actuelle du clip en secondes.
+	 * @param {boolean} pinLastWordToEnd Indique si le dernier mot doit finir à la fin du clip.
+	 * @returns {SubtitleAlignmentMetadata['words']} Timings WBW normalisés.
+	 */
+	private normalizeAlignmentWordsForClipDuration(
+		words: SubtitleAlignmentMetadata['words'],
+		clipDurationS: number,
+		pinLastWordToEnd: boolean
+	): SubtitleAlignmentMetadata['words'] {
+		let previousEnd = 0;
+
+		return words.map((word, index) => {
+			const isFirstWord = index === 0;
+			const isLastWord = index === words.length - 1;
+			const start = isFirstWord ? 0 : Math.max(previousEnd, Math.min(clipDurationS, word.start));
+			const targetEnd = pinLastWordToEnd && isLastWord ? clipDurationS : word.end;
+			const end = Math.max(start, Math.min(clipDurationS, targetEnd));
+			previousEnd = end;
+
+			return {
+				...word,
+				start,
+				end
+			};
+		});
+	}
+
+	/**
+	 * Recale les timings WBW après un changement de début du sous-titre.
+	 * @param {number} previousStartTime Ancien début du clip en millisecondes.
+	 * @returns {void}
+	 */
+	private retimeAlignmentMetadataAfterStartChange(previousStartTime: number): void {
+		if (!this.alignmentMetadata) return;
+
+		const clipDurationS = Math.max(0, (this.endTime - this.startTime) / 1000);
+		const offsetS = (previousStartTime - this.startTime) / 1000;
+		const shiftedWords = this.alignmentMetadata.words.map((word, index) => ({
+			...word,
+			start: index === 0 ? 0 : word.start + offsetS,
+			end: word.end + offsetS
+		}));
+
+		this.alignmentMetadata = {
+			...this.alignmentMetadata,
+			timeFrom: this.startTime / 1000,
+			timeTo: this.endTime / 1000,
+			words: this.normalizeAlignmentWordsForClipDuration(shiftedWords, clipDurationS, false)
+		};
+	}
+
+	/**
+	 * Recale les timings WBW après un changement de fin du sous-titre.
+	 * @returns {void}
+	 */
+	private retimeAlignmentMetadataAfterEndChange(): void {
+		if (!this.alignmentMetadata) return;
+
+		const clipDurationS = Math.max(0, (this.endTime - this.startTime) / 1000);
+		this.alignmentMetadata = {
+			...this.alignmentMetadata,
+			timeFrom: this.startTime / 1000,
+			timeTo: this.endTime / 1000,
+			words: this.normalizeAlignmentWordsForClipDuration(
+				this.alignmentMetadata.words,
+				clipDurationS,
+				true
+			)
+		};
+	}
+
+	override setEndTime(newEndTime: number) {
+		super.setEndTime(newEndTime);
+		// Si la modification a bien été prise en compte (pas d'erreur dans le super)
+		if (this.endTime === newEndTime) {
+			this.retimeAlignmentMetadataAfterEndChange();
+			super.markAsManualEdit();
+		}
+	}
+
+	override setStartTime(newStartTime: number) {
+		const previousStartTime = this.startTime;
+		super.setStartTime(newStartTime);
+		// Si la modification a bien été prise en compte (pas d'erreur dans le super)
+		if (this.startTime === newStartTime) {
+			this.retimeAlignmentMetadataAfterStartChange(previousStartTime);
+			super.markAsManualEdit();
+		}
+	}
+
+	// Utilise pour les ajustements automatiques qui ne doivent pas annuler l'origine IA.
+	setStartTimeSilently(newStartTime: number) {
+		const previousStartTime = this.startTime;
+		super.setStartTime(newStartTime);
+		if (this.startTime === newStartTime) {
+			this.retimeAlignmentMetadataAfterStartChange(previousStartTime);
+		}
+	}
+
+	// Utilise pour les ajustements automatiques qui ne doivent pas annuler l'origine IA.
+	setEndTimeSilently(newEndTime: number) {
+		super.setEndTime(newEndTime);
+		if (this.endTime === newEndTime) {
+			this.retimeAlignmentMetadataAfterEndChange();
+		}
+	}
+
+	/**
+	 * Crée un clone du clip avec de nouveaux timestamps.
+	 * @param newStartTime Le nouveau temps de début.
+	 * @param newEndTime Le nouveau temps de fin.
+	 * @returns Un nouveau SubtitleClip avec les mêmes propriétés mais des timestamps différents.
+	 */
+	cloneWithTimes(newStartTime: number, newEndTime: number): SubtitleClip {
+		const clonedClip = new SubtitleClip(
+			newStartTime,
+			newEndTime,
+			this.surah,
+			this.verse,
+			this.startWordIndex,
+			this.endWordIndex,
+			this.text,
+			JSON.parse(JSON.stringify(this.wbwTranslation)),
+			this.isFullVerse,
+			this.isLastWordsOfVerse,
+			Object.fromEntries(
+				Object.entries(this.translations).map(([key, t]) => [
+					key,
+					typeof t.clone === 'function' ? t.clone() : JSON.parse(JSON.stringify(t))
+				])
+			)
+		);
+
+		clonedClip.arabicInlineStyleRuns = JSON.parse(JSON.stringify(this.arabicInlineStyleRuns ?? []));
+		clonedClip.associatedImagePath = this.associatedImagePath;
+		clonedClip.needsLongReview = this.needsLongReview;
+		clonedClip.needsWbwTimestampReview = this.needsWbwTimestampReview;
+		clonedClip.needsReview = this.needsReview;
+		clonedClip.needsCoverageReview = this.needsCoverageReview;
+		clonedClip.hasBeenVerified = this.hasBeenVerified;
+		clonedClip.comeFromIA = this.comeFromIA;
+		clonedClip.confidence = this.confidence;
+		clonedClip.alignmentMetadata = this.alignmentMetadata
+			? JSON.parse(JSON.stringify(this.alignmentMetadata))
+			: null;
+		clonedClip.wbwTimestampsManuallyEdited = this.wbwTimestampsManuallyEdited;
+		clonedClip.visualMergeGroupId = this.visualMergeGroupId;
+		clonedClip.visualMergeMode = this.visualMergeMode;
+		return clonedClip;
+	}
+}
+
+export class SilenceClip extends Clip {
+	constructor(startTime: number, endTime: number) {
+		super(startTime, endTime, 'Silence');
+	}
+}
+
+export type PredefinedSubtitleType =
+	| 'Basmala'
+	| "Isti'adha"
+	| 'Amin'
+	| 'Takbir'
+	| 'Tahmeed'
+	| 'Tasleem'
+	| 'Sadaqa'
+	| 'Other';
+
+const PREDEFINED_ARABIC_TEXT: Record<PredefinedSubtitleType, string> = {
+	Basmala: 'بِسْمِ ٱللَّهِ ٱلرَّحْمَٰنِ ٱلرَّحِيم',
+	"Isti'adha": 'أَعُوذُ بِٱللَّهِ مِنَ الشَّيْطَانِ الرَّجِيم',
+	Amin: 'آمِين',
+	Takbir: 'اللَّهُ أَكْبَر',
+	Tahmeed: 'سَمِعَ اللَّهُ لِمَنْ حَمِدَه',
+	Tasleem: 'ٱلسَّلَامُ عَلَيْكُمْ وَرَحْمَةُ ٱللَّه',
+	Sadaqa: 'صَدَقَ ٱللَّهُ ٱلْعَظِيم',
+	Other: ''
+};
+
+export function canonicalizePredefinedSubtitleType(
+	type?: string
+): PredefinedSubtitleType | 'Other' {
+	switch (type) {
+		case 'Basmala':
+			return 'Basmala';
+		case "Isti'adha":
+		case 'Istiadhah':
+			return "Isti'adha";
+		case 'Amin':
+			return 'Amin';
+		case 'Takbir':
+			return 'Takbir';
+		case 'Tahmeed':
+			return 'Tahmeed';
+		case 'Tasleem':
+			return 'Tasleem';
+		case 'Sadaqa':
+		case 'Sadaqallahul Azim':
+			return 'Sadaqa';
+		default:
+			return 'Other';
+	}
+}
+
+export function getPredefinedArabicText(type: PredefinedSubtitleType | 'Other'): string {
+	return PREDEFINED_ARABIC_TEXT[type] ?? '';
+}
+
+/**
+ * Force certaines polices pour les sous-titres prédéfinis
+ *
+ * Règle:
+ * - Si on a QPC1 ou QPC2 alors on force Hafs pour les sous-titres prédéfinis non-supporté par ces polices
+ * - Si la police supporte un texte pré-défini comme le sadaqa, alors on force la police correspondante
+ * - Si la police est une police personnalisée, alors on ne force aucune police
+ *
+ * @param type Le type de sous-titre prédéfini
+ * @returns La police à utiliser ou null si aucune police n'est forcée
+ */
+export function getForcedFontForPredefinedSubtitle(
+	type?: string,
+	currentArabicFontFamily?: string
+): string | null {
+	const canonicalType = canonicalizePredefinedSubtitleType(type);
+
+	const activeFontFamily =
+		currentArabicFontFamily ?? String(globalState.getStyle('arabic', 'font-family')?.value ?? '');
+
+	const isQpcFont = activeFontFamily === 'QPC1' || activeFontFamily === 'QPC2';
+
+	// Sadaqa a un glyph spécifique en QPC2
+	if (canonicalType === 'Sadaqa') return isQpcFont ? 'QPC2BSML' : null;
+
+	// Toutes les autres polices ont Hafs si on est en QPC1 ou QPC2
+	const shouldForceHafs = isQpcFont;
+
+	if (
+		shouldForceHafs &&
+		(canonicalType === 'Amin' ||
+			canonicalType === 'Takbir' ||
+			canonicalType === 'Tahmeed' ||
+			canonicalType === 'Tasleem')
+	) {
+		return 'Hafs';
+	}
+	return null;
+}
+
+export class PredefinedSubtitleClip extends ClipWithTranslation {
+	predefinedSubtitleType: PredefinedSubtitleType = $state('Other');
+	alignmentMetadata: SubtitleAlignmentMetadata | null = $state(null);
+
+	constructor(
+		startTime: number = 0,
+		endTime: number = 0,
+		type: PredefinedSubtitleType = 'Other',
+		text: string = '',
+		comeFromIA: boolean = false,
+		confidence: number | null = null,
+		projectTranslation: ProjectTranslation | null = globalState.currentProject?.content
+			.projectTranslation ?? null
+	) {
+		const isDeserializationCall = arguments.length === 0;
+		const canonicalType = canonicalizePredefinedSubtitleType(type);
+		const _text = canonicalType === 'Other' ? text : getPredefinedArabicText(canonicalType);
+
+		// Ajoute les traductions du clip
+		const translations: { [key: string]: Translation } = {};
+
+		// Recupere les traductions ajoutees au projet
+		if (!isDeserializationCall && projectTranslation)
+			for (const edition of projectTranslation.addedTranslationEditions) {
+				translations[edition.name] = projectTranslation.getPredefinedSubtitleTranslation(
+					edition,
+					canonicalType
+				);
+			}
+
+		super(_text, startTime, endTime, 'Pre-defined Subtitle', translations, comeFromIA, confidence);
+
+		this.predefinedSubtitleType = canonicalType;
+	}
+
+	private getCanonicalType(): PredefinedSubtitleType {
+		const canonicalType = canonicalizePredefinedSubtitleType(this.predefinedSubtitleType);
+		if (this.predefinedSubtitleType !== canonicalType) {
+			this.predefinedSubtitleType = canonicalType;
+		}
+		return canonicalType;
+	}
+
+	/**
+	 * Retourne le texte du clip en fonction de la police d'ecriture
+	 * @returns Le texte du clip
+	 */
+	override getText(): string {
+		const canonicalType = this.getCanonicalType();
+		const basmalaStyle = String(
+			globalState.currentProject?.content.videoStyle
+				.getStylesOfTarget('arabic')
+				.getEffectiveValue('basmala-style', this.id) ?? 'current-font'
+		);
+
+		if (canonicalType === 'Basmala' && basmalaStyle !== 'current-font') {
+			return basmalaStyle;
+		}
+		const istiadhaStyle = String(
+			globalState.currentProject?.content.videoStyle
+				.getStylesOfTarget('arabic')
+				.getEffectiveValue('istiadha-style', this.id) ?? 'current-font'
+		);
+		if (canonicalType === "Isti'adha" && istiadhaStyle !== 'current-font') {
+			return istiadhaStyle;
+		}
+
+		// En fonction de la police d'ecriture, renvoie le bon texte
+		const fontFamily = String(
+			globalState.currentProject?.content.videoStyle
+				.getStylesOfTarget('arabic')
+				.getEffectiveValue('font-family', this.id) ??
+				globalState.getStyle('arabic', 'font-family')?.value ??
+				''
+		);
+		const qpcVersion = fontFamily === 'QPC1' ? '1' : fontFamily === 'QPC2' ? '2' : null;
+
+		if (canonicalType === 'Sadaqa') {
+			return qpcVersion ? QPCFontProvider.getSadaqaGlyph() : super.getText();
+		}
+
+		// Si on a pas une police avec les caracteres speciaux
+		if (!qpcVersion) {
+			return super.getText();
+		}
+
+		if (canonicalType === 'Basmala') return QPCFontProvider.getBasmalaGlyph(qpcVersion);
+		if (canonicalType === "Isti'adha") return QPCFontProvider.getIstiadhahGlyph(qpcVersion);
+
+		// Dans ce cas, on retourne le texte par defaut
+		return super.getText();
+	}
+}
+
+export class CustomClip extends Clip {
+	category: Category | undefined = $state(undefined);
+
+	constructor(startTime: number, endTime: number, type: 'text' | 'image', category?: Category) {
+		super(startTime, endTime, 'Custom Text');
+		this.type = type === 'text' ? 'Custom Text' : 'Custom Image';
+		this.category = category;
+	}
+
+	/**
+	 * Retourne les apparitions temporelles du contenu personnalisé.
+	 * @param {boolean} [sort=true] Trie les plages par apparition.
+	 * @returns {TimedOverlayRange[]} Plages temporelles normalisées.
+	 */
+	getTimedOverlayRanges(sort = true): TimedOverlayRange[] {
+		return getTimedOverlayRangesFromStyles(this.category?.styles ?? [], sort);
+	}
+
+	/**
+	 * Met à jour le début du clip et sa première plage d'apparition.
+	 * @param {number} newStartTime Nouveau début en millisecondes.
+	 * @returns {void}
+	 */
+	override setStartTime(newStartTime: number): void {
+		ProjectHistoryManager.begin('set custom clip start');
+		try {
+			const rangesStyle = this.category?.getStyle('time-ranges');
+			const ranges = rangesStyle ? this.getTimedOverlayRanges() : [];
+			const nextRanges = rangesStyle
+				? updateTimedOverlayRange(ranges, 0, 'startTime', newStartTime)
+				: [];
+			super.setStartTime(nextRanges[0]?.startTime ?? newStartTime);
+			if (rangesStyle) {
+				rangesStyle.value = nextRanges;
+				syncTimedOverlayLegacyRange(this.category?.styles ?? [], nextRanges[0]);
+			}
+		} finally {
+			ProjectHistoryManager.commit();
+		}
+	}
+
+	/**
+	 * Met à jour la fin du clip et sa première plage d'apparition.
+	 * @param {number} newEndTime Nouvelle fin en millisecondes.
+	 * @returns {void}
+	 */
+	override setEndTime(newEndTime: number): void {
+		ProjectHistoryManager.begin('set custom clip end');
+		try {
+			const rangesStyle = this.category?.getStyle('time-ranges');
+			const ranges = rangesStyle ? this.getTimedOverlayRanges() : [];
+			const nextRanges = rangesStyle
+				? updateTimedOverlayRange(ranges, 0, 'endTime', newEndTime)
+				: [];
+			super.setEndTime(nextRanges[0]?.endTime ?? newEndTime);
+			if (rangesStyle) {
+				rangesStyle.value = nextRanges;
+				syncTimedOverlayLegacyRange(this.category?.styles ?? [], nextRanges[0]);
+			}
+		} finally {
+			ProjectHistoryManager.commit();
+		}
+	}
+
+	setStyle(styleId: StyleName, value: Style['value']) {
+		ProjectHistoryManager.begin('set custom clip style');
+		try {
+			if (styleId === 'time-ranges') {
+				const ranges = getTimedOverlayRanges(value);
+				const firstRange = ranges[0];
+				if (firstRange) {
+					this.startTime = firstRange.startTime;
+					this.endTime = firstRange.endTime;
+					this.duration = firstRange.endTime - firstRange.startTime;
+					syncTimedOverlayLegacyRange(this.category!.styles, firstRange);
+				}
+				this.category!.styles.find((style) => style.id === styleId)!.value = ranges;
+			} else if (styleId === 'time-appearance') {
+				if (typeof value === 'number') this.setStartTime(value);
+			} else if (styleId === 'time-disappearance') {
+				if (typeof value === 'number') this.setEndTime(value);
+			}
+
+			if (styleId !== 'time-ranges') {
+				this.category!.styles.find((style) => style.id === styleId)!.value = value;
+			}
+		} finally {
+			ProjectHistoryManager.commit();
+		}
+	}
+
+	getAlwaysShow(): boolean {
+		return this.category?.getStyle('always-show')!.value as boolean;
+	}
+
+	override getWidth(): number {
+		const timelineZoom = globalState.currentProject?.projectEditorState.timeline.zoom ?? 0;
+		// Si le custom text s'affiche sur toute la durée de la vidéo, alors retourne le temps
+		// total de la vidéo
+		if (this.getAlwaysShow()) {
+			const longestTrackDuration =
+				globalState.currentProject?.content.timeline.getLongestTrackDuration().toSeconds() ?? 0;
+			return longestTrackDuration * timelineZoom;
+		} else {
+			// Appel du getWidth du parent
+			return super.getWidth();
+		}
+	}
+}
+
+export class CustomTextClip extends CustomClip {
+	constructor(category?: Category) {
+		const firstRange = getTimedOverlayRangesFromStyles(category?.styles ?? [])[0];
+		const startTime = firstRange?.startTime ?? 0;
+		const endTime = firstRange?.endTime ?? 0;
+
+		super(startTime, endTime, 'text', category);
+		this.category = category;
+	}
+
+	getText() {
+		return this.category?.getStyle('text')!.value as string;
+	}
+}
+
+export class CustomImageClip extends CustomClip {
+	constructor(category?: Category) {
+		const firstRange = getTimedOverlayRangesFromStyles(category?.styles ?? [])[0];
+		const startTime = firstRange?.startTime ?? 0;
+		const endTime = firstRange?.endTime ?? 0;
+
+		super(startTime, endTime, 'image', category);
+		this.category = category;
+	}
+
+	getFilePath() {
+		return this.category?.getStyle('filepath')!.value as string;
+	}
+}

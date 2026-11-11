@@ -1,0 +1,816 @@
+<script lang="ts">
+	import { ManualAiSession } from '$lib/services/ManualAiSession.svelte';
+	import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+	import Settings from '$lib/classes/Settings.svelte';
+	import type {
+		ActivityTone,
+		AiWbwTranslationCandidate,
+		WbwTranslationActivityEntry,
+		WbwTranslationChunkEventPayload,
+		WbwTranslationCompleteEventPayload,
+		WbwTranslationStatusEventPayload
+	} from '$lib/services/AiWbwTranslationMappingTypes';
+	import type { AdvancedTrimUsage } from '$lib/services/AdvancedAITrimming';
+	import AiBatchOverviewCard from './shared/AiBatchOverviewCard.svelte';
+	import AiStreamingWorkerGrid from './shared/AiStreamingWorkerGrid.svelte';
+	import TranslationsEditorModalShell from './shared/TranslationsEditorModalShell.svelte';
+	import VerseRangeSlider from '$lib/components/projectEditor/tabs/export/VerseRangeSlider.svelte';
+	import { buildVerseRangeSliderOptions } from '$lib/components/projectEditor/tabs/export/VerseRangeSlider';
+	import {
+		applyAiWbwTranslationValidationSuccess,
+		buildAiWbwTranslationBatches,
+		buildAiWbwTranslationCandidates,
+		estimateAiWbwTranslationCost,
+		runAiWbwTranslationBatchStreaming,
+		validateAiWbwTranslationBatchResult
+	} from '$lib/services/AiWbwTranslationMappingService';
+	import { formatUsd } from '$lib/services/AdvancedAITrimming';
+	import { AnalyticsService } from '$lib/services/AnalyticsService';
+	import { globalState } from '$lib/runes/main.svelte';
+	import { onDestroy, onMount } from 'svelte';
+	import toast from 'svelte-5-french-toast';
+	import LL from '$lib/i18n/i18n-svelte';
+	import { get } from 'svelte/store';
+	import {
+		AiStreamChunkBuffer,
+		runAiWorkerPool,
+		type AiStreamChunkUpdate,
+		type AiStreamWorker
+	} from '$lib/services/AiWorkerPool';
+
+	type ActivityEntry = WbwTranslationActivityEntry;
+	type StatusEventPayload = WbwTranslationStatusEventPayload;
+	type ChunkEventPayload = WbwTranslationChunkEventPayload;
+	type CompleteEventPayload = WbwTranslationCompleteEventPayload;
+	const AI_TRANSLATION_WORKER_COUNT = 3;
+
+	let { close }: { close: () => void } = $props();
+
+	const translationsEditorState = $derived(
+		() => globalState.currentProject!.projectEditorState.translationsEditor
+	);
+
+	const visibleEditions = $derived(() =>
+		globalState.currentProject!.content.projectTranslation.addedTranslationEditions.filter(
+			(edition) => edition.showInTranslationsEditor
+		)
+	);
+
+	const selectedAiWbwTranslationEdition = $derived(
+		() =>
+			visibleEditions().find(
+				(edition) => edition.name === translationsEditorState().aiWbwTranslationEditionName
+			) ?? visibleEditions()[0]
+	);
+
+	const totalDurationMs = $derived(
+		Math.max(
+			globalState.getAudioTrack?.getDuration().ms ||
+				globalState.getSubtitleTrack?.getDuration().ms ||
+				0,
+			1
+		)
+	);
+
+	let aiWbwTranslationCandidates: AiWbwTranslationCandidate[] = $state([]);
+	let isLoadingCandidates = $state(false);
+	let candidatesRequestId = 0;
+
+	const aiWbwTranslationBatches = $derived(() =>
+		buildAiWbwTranslationBatches(
+			aiWbwTranslationCandidates,
+			globalState.settings!.aiTranslationSettings.advancedTrimModel,
+			globalState.settings!.aiTranslationSettings.advancedTrimReasoningEffort,
+			translationsEditorState().aiWbwTranslationStartTimeMs,
+			translationsEditorState().aiWbwTranslationEndTimeMs
+		)
+	);
+
+	const aiWbwTranslationEstimate = $derived(() =>
+		estimateAiWbwTranslationCost(
+			aiWbwTranslationBatches(),
+			globalState.settings!.aiTranslationSettings.advancedTrimReasoningEffort
+		)
+	);
+
+	const selectedAiWbwTranslationSegments = $derived(
+		() =>
+			aiWbwTranslationCandidates.filter(
+				(candidate) =>
+					candidate.startTime <= translationsEditorState().aiWbwTranslationEndTimeMs &&
+					candidate.endTime >= translationsEditorState().aiWbwTranslationStartTimeMs
+			).length
+	);
+
+	let isRunning = $state(false);
+	let manualMode = $state(!globalState.settings?.aiTranslationSettings.openAiApiKey.trim());
+	const session = new ManualAiSession();
+	let aiWbwTranslationStartTimeMs = $state(0);
+	let aiWbwTranslationEndTimeMs = $state(0);
+	let completedBatches = $state(0);
+	let successfulBatches = $state(0);
+	let failedBatches = $state(0);
+	let successfulSegments = $state(0);
+	let failedSegments = $state(0);
+	let workers: AiStreamWorker[] = $state(createIdleWorkers());
+	let latestSummary = $state('');
+	let activityLog: ActivityEntry[] = $state([]);
+	let batchUsageById: Record<string, AdvancedTrimUsage> = $state({});
+	let unlistenFns: UnlistenFn[] = [];
+	let activityCounter = 0;
+	let activeBatchIds = new Set<string>();
+	let aiWbwTranslationNoteSaveTimeoutId: number | null = null;
+	const chunkBuffer = new AiStreamChunkBuffer(applyBufferedChunks);
+
+	/**
+	 * Crée les trois emplacements de workers affichés dans le modal.
+	 *
+	 * @returns {AiStreamWorker[]} Workers initialisés au repos.
+	 */
+	function createIdleWorkers(): AiStreamWorker[] {
+		return Array.from({ length: AI_TRANSLATION_WORKER_COUNT }, (_, index) => ({
+			workerId: index + 1,
+			batchId: '',
+			batchLabel: '',
+			step: 'idle',
+			reasoning: '',
+			response: ''
+		}));
+	}
+
+	/**
+	 * Synchronise la plage sélectionnée avec la durée disponible.
+	 *
+	 * @param {boolean} resetToFullRange Force la sélection de toute la timeline.
+	 * @returns {void}
+	 */
+	function syncSelectionWindow(resetToFullRange: boolean = false): void {
+		if (
+			resetToFullRange ||
+			aiWbwTranslationEndTimeMs <= 0 ||
+			aiWbwTranslationEndTimeMs > totalDurationMs
+		) {
+			aiWbwTranslationStartTimeMs = 0;
+			aiWbwTranslationEndTimeMs = totalDurationMs;
+			return;
+		}
+
+		aiWbwTranslationStartTimeMs = Math.max(
+			0,
+			Math.min(aiWbwTranslationStartTimeMs, totalDurationMs)
+		);
+		aiWbwTranslationEndTimeMs = Math.max(
+			aiWbwTranslationStartTimeMs,
+			Math.min(aiWbwTranslationEndTimeMs, totalDurationMs)
+		);
+	}
+
+	/**
+	 * Persiste la plage temporelle du modal dans l'état projet.
+	 *
+	 * @returns {void}
+	 */
+	function persistAiWbwTranslationRange(): void {
+		translationsEditorState().aiWbwTranslationStartTimeMs = aiWbwTranslationStartTimeMs;
+		translationsEditorState().aiWbwTranslationEndTimeMs = aiWbwTranslationEndTimeMs;
+	}
+
+	/**
+	 * Programme une sauvegarde différée de la note IA globale.
+	 *
+	 * @returns {void}
+	 */
+	function queueAiWbwTranslationNoteSave(): void {
+		if (aiWbwTranslationNoteSaveTimeoutId !== null) {
+			window.clearTimeout(aiWbwTranslationNoteSaveTimeoutId);
+		}
+
+		aiWbwTranslationNoteSaveTimeoutId = window.setTimeout(() => {
+			aiWbwTranslationNoteSaveTimeoutId = null;
+			void Settings.save();
+		}, 250);
+	}
+
+	/**
+	 * Met à jour la note personnalisée utilisée par l'assistant WBW traduction.
+	 *
+	 * @param {string} value Nouvelle note utilisateur.
+	 * @returns {void}
+	 */
+	function updateAiWbwTranslationCustomNote(value: string): void {
+		globalState.settings!.aiTranslationSettings.aiWbwTranslationCustomNote = value;
+		queueAiWbwTranslationNoteSave();
+	}
+
+	/**
+	 * Ajoute une entrée au journal d'activité du run courant.
+	 *
+	 * @param {string} step Étape technique.
+	 * @param {string} message Message affiché.
+	 * @param {ActivityTone} tone Niveau visuel du message.
+	 * @param {string} batchId Identifiant du batch concerné.
+	 * @returns {void}
+	 */
+	function addActivity(
+		step: string,
+		message: string,
+		tone: ActivityTone = 'info',
+		batchId: string = ''
+	): void {
+		activityCounter += 1;
+		activityLog = [
+			{
+				id: `ai-wbw-translation-activity-${activityCounter}`,
+				batchId,
+				step,
+				message,
+				tone
+			},
+			...activityLog
+		].slice(0, 80);
+	}
+
+	/**
+	 * Détecte les erreurs provider qui doivent interrompre les batches suivants.
+	 *
+	 * @param {string} message Message d'erreur reçu.
+	 * @returns {boolean} `true` si l'erreur est bloquante.
+	 */
+	function isBlockingError(message: string): boolean {
+		return /\b(401|402|403|429|500|502|503|504)\b/.test(message);
+	}
+
+	/**
+	 * Réinitialise l'état local avant un nouveau run IA.
+	 *
+	 * @returns {void}
+	 */
+	function resetRunState(): void {
+		chunkBuffer.clear();
+		completedBatches = 0;
+		successfulBatches = 0;
+		failedBatches = 0;
+		successfulSegments = 0;
+		failedSegments = 0;
+		workers = createIdleWorkers();
+		latestSummary = '';
+		activityLog = [];
+		batchUsageById = {};
+		activeBatchIds = new Set<string>();
+	}
+
+	/**
+	 * Ajoute les deltas regroupés aux workers correspondants.
+	 *
+	 * @param {AiStreamChunkUpdate[]} chunks Deltas regroupés par batch.
+	 * @returns {void}
+	 */
+	function applyBufferedChunks(chunks: AiStreamChunkUpdate[]): void {
+		for (const chunk of chunks) {
+			const worker = workers.find((item) => item.batchId === chunk.batchId);
+			if (!worker) continue;
+			worker.reasoning += chunk.reasoning;
+			worker.response += chunk.response;
+		}
+	}
+
+	/**
+	 * Traite les événements de statut Tauri pour les batches actifs.
+	 *
+	 * @param {{ payload: StatusEventPayload }} event Événement Tauri.
+	 * @returns {void}
+	 */
+	function handleStatusEvent(event: { payload: StatusEventPayload }): void {
+		const payload = event.payload;
+		if (!activeBatchIds.has(payload.batchId)) return;
+		const worker = workers.find((item) => item.batchId === payload.batchId);
+		if (worker) worker.step = payload.step;
+		addActivity(
+			payload.step,
+			payload.message,
+			payload.step === 'failed' ? 'error' : 'info',
+			payload.batchId
+		);
+	}
+
+	/**
+	 * Met à jour la réponse streamée affichée dans le modal.
+	 *
+	 * @param {{ payload: ChunkEventPayload }} event Événement Tauri.
+	 * @returns {void}
+	 */
+	function handleChunkEvent(event: { payload: ChunkEventPayload }): void {
+		const payload = event.payload;
+		if (!activeBatchIds.has(payload.batchId)) return;
+		chunkBuffer.push(payload.batchId, payload.kind ?? 'response', payload.delta);
+	}
+
+	/**
+	 * Capture la réponse finale et l'usage d'un batch terminé.
+	 *
+	 * @param {{ payload: CompleteEventPayload }} event Événement Tauri.
+	 * @returns {void}
+	 */
+	function handleCompleteEvent(event: { payload: CompleteEventPayload }): void {
+		const payload = event.payload;
+		if (!activeBatchIds.has(payload.batchId)) return;
+		chunkBuffer.flush();
+		const worker = workers.find((item) => item.batchId === payload.batchId);
+		if (worker) worker.response = payload.rawText;
+		if (payload.usage) {
+			batchUsageById = {
+				...batchUsageById,
+				[payload.batchId]: payload.usage
+			};
+		}
+	}
+
+	/**
+	 * Calcule la progression globale du run.
+	 *
+	 * @returns {number} Pourcentage de progression.
+	 */
+	function getProgressPercent(): number {
+		if (aiWbwTranslationBatches().length === 0) return 0;
+		return Math.round((completedBatches / aiWbwTranslationBatches().length) * 100);
+	}
+
+	/**
+	 * Résume l'usage tokens réellement retourné par le provider.
+	 *
+	 * @returns {string} Résumé localisé de l'usage.
+	 */
+	function getActualUsageSummary(): string {
+		const usageList = Object.values(batchUsageById);
+		if (usageList.length === 0) return get(LL).editor.usageUnavailable();
+
+		const input = usageList.reduce((total, item) => total + (item.inputTokens ?? 0), 0);
+		const output = usageList.reduce((total, item) => total + (item.outputTokens ?? 0), 0);
+		const total = usageList.reduce((sum, item) => sum + (item.totalTokens ?? 0), 0);
+
+		return get(LL).editor.tokenUsageSummary({ input, output, total });
+	}
+
+	/**
+	 * Lance l'assistant IA et applique les mappings WBW traduction validés.
+	 *
+	 * @returns {Promise<void>} Promesse résolue après la fin du run.
+	 */
+	async function runAiWbwTranslation(): Promise<void> {
+		if (isRunning) return;
+
+		const edition = selectedAiWbwTranslationEdition();
+		if (!edition) {
+			toast.error(get(LL).editor.noVisibleTranslation());
+			return;
+		}
+
+		const apiKey = globalState.settings!.aiTranslationSettings.openAiApiKey.trim();
+		if (!manualMode && !apiKey) {
+			toast.error(get(LL).translations.configureAiKeyFirst());
+			return;
+		}
+
+		const endpoint = globalState.settings!.aiTranslationSettings.textAiApiEndpoint.trim();
+		if (!manualMode && !endpoint) {
+			toast.error(get(LL).translations.configureTextAiFirst());
+			return;
+		}
+
+		const batches = aiWbwTranslationBatches();
+		if (batches.length === 0) {
+			toast.error(get(LL).editor.noEligibleTranslatedSegments());
+			return;
+		}
+		const analyticsWorkflow = AnalyticsService.trackAiWbwTranslationStarted({
+			mode: 'advanced_wbw_translation',
+			model: globalState.settings!.aiTranslationSettings.advancedTrimModel,
+			reasoning_effort: globalState.settings!.aiTranslationSettings.advancedTrimReasoningEffort,
+			total_batches: batches.length,
+			total_segments: aiWbwTranslationEstimate().totalSegments,
+			edition_key: edition.key,
+			edition_language: edition.language
+		});
+
+		resetRunState();
+		isRunning = true;
+
+		let manualResponses: Awaited<ReturnType<ManualAiSession['prepareBatches']>> | undefined;
+		if (manualMode) {
+			const sourceProject = globalState.currentProject;
+			try {
+				manualResponses = await session.prepareBatches(
+					'translation_wbw',
+					batches,
+					validateAiWbwTranslationBatchResult,
+					/**
+					 * Capture le contenu source sans les états de lecture ou de configuration.
+					 * @returns {string} Contenu sérialisé, ou chaîne vide si le projet a changé.
+					 */
+					() =>
+						globalState.currentProject === sourceProject
+							? JSON.stringify(sourceProject?.content.toJSON())
+							: '',
+					globalState.settings!.aiTranslationSettings.aiWbwTranslationCustomNote
+				);
+			} catch (error) {
+				isRunning = false;
+				if (!(error instanceof DOMException && error.name === 'AbortError')) {
+					toast.error(error instanceof Error ? error.message : String(error));
+				}
+				return;
+			}
+		}
+		activeBatchIds = new Set<string>(batches.map((batch) => batch.batchId));
+		addActivity(
+			'queued',
+			get(LL).editor.aiWbwTranslationStarting({
+				segments: aiWbwTranslationEstimate().totalSegments,
+				batches: batches.length
+			})
+		);
+
+		const reportLines: string[] = [];
+		let blockingFailure = false;
+
+		await runAiWorkerPool(
+			batches,
+			AI_TRANSLATION_WORKER_COUNT,
+			async (batch, batchIndex, workerIndex) => {
+				const worker = workers[workerIndex];
+				const batchLabel = get(LL).editor.batchProgress({
+					current: batchIndex + 1,
+					total: batches.length
+				});
+				worker.batchId = batch.batchId;
+				worker.batchLabel = batchLabel;
+				worker.step = 'queued';
+				worker.reasoning = '';
+				worker.response = '';
+
+				addActivity(
+					'queued',
+					get(LL).editor.aiWbwTranslationBatchQueued({
+						label: batchLabel,
+						segments: batch.segments.length,
+						words: batch.wordCount
+					}),
+					'info',
+					batch.batchId
+				);
+
+				try {
+					const response =
+						manualResponses?.get(batch.batchId) ??
+						(await runAiWbwTranslationBatchStreaming({
+							apiKey,
+							endpoint,
+							model: globalState.settings!.aiTranslationSettings.advancedTrimModel,
+							reasoningEffort:
+								globalState.settings!.aiTranslationSettings.advancedTrimReasoningEffort,
+							batchId: batch.batchId,
+							customPromptNote:
+								globalState.settings!.aiTranslationSettings.aiWbwTranslationCustomNote,
+							batch: batch.request
+						}));
+
+					chunkBuffer.flush();
+					worker.response = response.rawText;
+					worker.step = 'validating';
+					addActivity(
+						'validating',
+						get(LL).editor.validatingBatch({ label: batchLabel }),
+						'info',
+						batch.batchId
+					);
+
+					const validation = validateAiWbwTranslationBatchResult(batch, response.parsed);
+					const applyReport = applyAiWbwTranslationValidationSuccess(
+						edition,
+						validation.validSegments
+					);
+					const validationFailedSegments = batch.segments.length - validation.validSegments.length;
+
+					if (validationFailedSegments === 0 && applyReport.erroredSegments === 0) {
+						successfulBatches++;
+						worker.step = 'completed';
+					} else {
+						failedBatches++;
+						worker.step = 'failed';
+					}
+
+					successfulSegments += applyReport.appliedSegments;
+					failedSegments += validationFailedSegments + applyReport.erroredSegments;
+
+					if (applyReport.appliedSegments > 0) {
+						addActivity(
+							'applied',
+							get(LL).editor.aiWbwTranslationAppliedSegments({
+								applied: applyReport.appliedSegments,
+								total: batch.segments.length
+							}),
+							'success',
+							batch.batchId
+						);
+					}
+
+					if (validation.errors.length > 0) {
+						reportLines.push(batchLabel, ...validation.errors);
+						for (const error of validation.errors) {
+							addActivity('failed', error, 'error', batch.batchId);
+						}
+					}
+
+					if (applyReport.errors.length > 0) {
+						reportLines.push(...applyReport.errors);
+						for (const error of applyReport.errors) {
+							addActivity('failed', error, 'error', batch.batchId);
+						}
+					}
+				} catch (error) {
+					failedBatches++;
+					failedSegments += batch.segments.length;
+					worker.step = 'failed';
+					const message = error instanceof Error ? error.message : String(error);
+					reportLines.push(batchLabel, message);
+					addActivity('failed', message, 'error', batch.batchId);
+
+					if (isBlockingError(message)) {
+						blockingFailure = true;
+					}
+				} finally {
+					chunkBuffer.flush();
+					completedBatches++;
+				}
+			},
+			() => blockingFailure
+		);
+
+		isRunning = false;
+		activeBatchIds = new Set<string>();
+		latestSummary = get(LL).editor.aiWbwTranslationRunSummary({
+			successful: successfulSegments,
+			total: aiWbwTranslationEstimate().totalSegments,
+			failed: failedSegments
+		});
+
+		AnalyticsService.trackAiWbwTranslationUsage(
+			analyticsWorkflow,
+			successfulSegments === 0 ? 'failed' : failedSegments > 0 ? 'partial' : 'completed',
+			{
+				mode: 'advanced_wbw_translation',
+				model: globalState.settings!.aiTranslationSettings.advancedTrimModel,
+				reasoning_effort: globalState.settings!.aiTranslationSettings.advancedTrimReasoningEffort,
+				total_batches: aiWbwTranslationBatches().length,
+				completed_batches: completedBatches,
+				successful_batches: successfulBatches,
+				failed_batches: failedBatches,
+				total_segments: aiWbwTranslationEstimate().totalSegments,
+				successful_segments: successfulSegments,
+				failed_segments: failedSegments,
+				estimated_cost_usd: aiWbwTranslationEstimate().totalEstimatedCostUsd,
+				custom_note_length:
+					globalState.settings!.aiTranslationSettings.aiWbwTranslationCustomNote.trim().length,
+				edition_key: edition.key,
+				edition_language: edition.language
+			}
+		);
+
+		if (reportLines.length > 0) {
+			toast.error(get(LL).editor.aiWbwTranslationCompletedWithIssues());
+		} else {
+			toast.success(get(LL).editor.aiWbwTranslationApplied());
+		}
+		if (manualMode) close();
+	}
+
+	onMount(async () => {
+		aiWbwTranslationStartTimeMs = translationsEditorState().aiWbwTranslationStartTimeMs;
+		aiWbwTranslationEndTimeMs = translationsEditorState().aiWbwTranslationEndTimeMs;
+		syncSelectionWindow(true);
+		persistAiWbwTranslationRange();
+
+		unlistenFns = [
+			await listen('advanced-ai-wbw-translation-status', handleStatusEvent),
+			await listen('advanced-ai-wbw-translation-chunk', handleChunkEvent),
+			await listen('advanced-ai-wbw-translation-complete', handleCompleteEvent)
+		];
+	});
+
+	onDestroy(() => {
+		session.cancel();
+		chunkBuffer.clear();
+		if (aiWbwTranslationNoteSaveTimeoutId !== null) {
+			window.clearTimeout(aiWbwTranslationNoteSaveTimeoutId);
+			aiWbwTranslationNoteSaveTimeoutId = null;
+			void Settings.save();
+		}
+
+		for (const unlisten of unlistenFns) {
+			unlisten();
+		}
+		unlistenFns = [];
+	});
+
+	$effect(() => {
+		const visible = visibleEditions();
+		if (visible.length === 0) return;
+		if (
+			!visible.some(
+				(edition) => edition.name === translationsEditorState().aiWbwTranslationEditionName
+			)
+		) {
+			translationsEditorState().aiWbwTranslationEditionName = visible[0].name;
+		}
+	});
+
+	$effect(() => {
+		const edition = selectedAiWbwTranslationEdition();
+		const helperLanguage = globalState.settings?.persistentUiState.wbwTranslationLanguage ?? 'en';
+		const requestId = ++candidatesRequestId;
+
+		if (!edition) {
+			aiWbwTranslationCandidates = [];
+			return;
+		}
+
+		isLoadingCandidates = true;
+		void buildAiWbwTranslationCandidates(edition, helperLanguage)
+			.then((candidates) => {
+				if (requestId !== candidatesRequestId) return;
+				aiWbwTranslationCandidates = candidates;
+			})
+			.catch((error) => {
+				if (requestId !== candidatesRequestId) return;
+				aiWbwTranslationCandidates = [];
+				addActivity(
+					'failed',
+					error instanceof Error ? error.message : String(error),
+					'error',
+					'candidate-build'
+				);
+			})
+			.finally(() => {
+				if (requestId === candidatesRequestId) {
+					isLoadingCandidates = false;
+				}
+			});
+	});
+
+	$effect(() => {
+		syncSelectionWindow();
+		persistAiWbwTranslationRange();
+	});
+</script>
+
+<TranslationsEditorModalShell
+	manualSession={session}
+	bind:manual={manualMode}
+	busy={isRunning}
+	{close}
+	title={$LL.editor.aiWbwTranslationAssistant()}
+	icon="auto_fix_high"
+	shellClass="h-[92vh] xl:h-[84vh] w-[clamp(1180px,94vw,1500px)] max-w-[94vw] xl:max-w-[82vw]"
+	bodyClass="flex-1 min-h-0 overflow-hidden grid grid-cols-[minmax(0,1.05fr)_minmax(320px,0.95fr)]"
+	workspace={{
+		configuration: {
+			title: $LL.editor.configuration(),
+			description: $LL.editor.aiWbwTranslationConfigDescription(),
+			icon: 'link'
+		},
+		provider: {
+			title: $LL.editor.aiProvider(),
+			description: $LL.editor.aiProviderConfigHint(),
+			currentModelLabel: $LL.editor.currentModel(),
+			model: globalState.settings!.aiTranslationSettings.advancedTrimModel,
+			endpointLabel: $LL.editor.endpoint(),
+			endpoint: globalState.settings!.aiTranslationSettings.textAiApiEndpoint,
+			notSetLabel: $LL.editor.notSet()
+		},
+		run: {
+			title: $LL.editor.run(),
+			description: $LL.editor.aiWbwTranslationRunDescription(),
+			buttonLabel: isRunning
+				? $LL.editor.runningAiWbwTranslation()
+				: isLoadingCandidates
+					? $LL.editor.loadingSegments()
+					: $LL.editor.runAiWbwTranslation(),
+			disabled:
+				isRunning ||
+				isLoadingCandidates ||
+				aiWbwTranslationBatches().length === 0 ||
+				visibleEditions().length === 0,
+			onclick: runAiWbwTranslation
+		},
+		status: {
+			title: isRunning
+				? $LL.editor.aiWbwTranslationInProgress()
+				: $LL.editor.latestAiWbwTranslationRun(),
+			subtitle: isRunning
+				? $LL.editor.batchProgress({
+						current: completedBatches,
+						total: aiWbwTranslationBatches().length
+					})
+				: latestSummary || $LL.editor.noSummaryYet(),
+			progressPercent: getProgressPercent(),
+			metrics: [
+				{ label: $LL.editor.successfulSegments(), value: successfulSegments },
+				{ label: $LL.editor.failedSegments(), value: failedSegments },
+				{ label: $LL.editor.successfulBatches(), value: successfulBatches },
+				{ label: $LL.editor.usage(), value: getActualUsageSummary() }
+			]
+		},
+		activityLog
+	}}
+>
+	{#snippet subtitle()}
+		{$LL.editor.aiWbwTranslationSubtitle()}
+	{/snippet}
+
+	{#snippet configurationFields()}
+		{#if visibleEditions().length === 0}
+			<div class="rounded-xl border border-red-400/40 bg-red-500/10 px-4 py-4 text-sm text-red-100">
+				{$LL.editor.noVisibleTranslation()}
+			</div>
+		{:else}
+			<label class="block space-y-2">
+				<span class="text-sm font-medium text-secondary">{$LL.editor.targetEdition()}</span>
+				<select
+					value={translationsEditorState().aiWbwTranslationEditionName}
+					onchange={(event) =>
+						(translationsEditorState().aiWbwTranslationEditionName = (
+							event.target as HTMLSelectElement
+						).value)}
+					class="w-full rounded-lg border border-color bg-secondary px-3 py-2.5 text-sm text-primary"
+				>
+					{#each visibleEditions() as edition (edition.key)}
+						<option value={edition.name}>{edition.language} - {edition.author}</option>
+					{/each}
+				</select>
+			</label>
+		{/if}
+
+		<VerseRangeSlider
+			verses={buildVerseRangeSliderOptions(aiWbwTranslationCandidates)}
+			totalItems={aiWbwTranslationCandidates.length}
+			selectedItems={selectedAiWbwTranslationSegments()}
+			title={$LL.editor.aiWbwTranslationRange()}
+			totalLabel={$LL.editor.eligibleSegments()}
+			selectionLabel={$LL.tools.selectAyahRangeHint()}
+			bind:startTimeMs={aiWbwTranslationStartTimeMs}
+			bind:endTimeMs={aiWbwTranslationEndTimeMs}
+			showRangeLabel
+			onRangeChange={persistAiWbwTranslationRange}
+		/>
+
+		<label class="block space-y-2">
+			<span class="text-sm font-medium text-secondary">{$LL.editor.customNote()}</span>
+			<textarea
+				value={globalState.settings!.aiTranslationSettings.aiWbwTranslationCustomNote}
+				oninput={(event) =>
+					updateAiWbwTranslationCustomNote((event.target as HTMLTextAreaElement).value)}
+				onblur={() => void Settings.save()}
+				rows="4"
+				placeholder={$LL.editor.aiWbwTranslationCustomNotePlaceholder()}
+				class="w-full resize-y rounded-lg border border-color bg-secondary px-3 py-2 text-sm text-primary"
+			></textarea>
+			<span class="text-xs text-thirdly">
+				{$LL.editor.aiWbwTranslationCustomNoteHint()}
+			</span>
+		</label>
+	{/snippet}
+
+	{#snippet configurationSummary()}
+		<AiBatchOverviewCard
+			title={$LL.editor.batchPreview()}
+			icon="analytics"
+			metrics={[
+				{ label: $LL.editor.segments(), value: aiWbwTranslationEstimate().totalSegments },
+				{ label: $LL.editor.words(), value: aiWbwTranslationEstimate().totalWords },
+				{ label: $LL.editor.batches(), value: aiWbwTranslationBatches().length },
+				{
+					label: $LL.editor.estimatedCostShort(),
+					value: formatUsd(aiWbwTranslationEstimate().totalEstimatedCostUsd)
+				}
+			]}
+			estimatedCostLabel={formatUsd(aiWbwTranslationEstimate().totalEstimatedCostUsd)}
+			tokenSummary={$LL.editor.estimatedTokenSummary({
+				input: aiWbwTranslationEstimate().totalEstimatedInputTokens,
+				output: aiWbwTranslationEstimate().totalEstimatedOutputTokens
+			})}
+			reasoningNote={aiWbwTranslationEstimate().reasoningNote}
+			columnsClass="grid-cols-2"
+		/>
+
+		<div class="rounded-lg border border-color bg-secondary px-3 py-3 text-xs text-thirdly">
+			{$LL.editor.targetingEdition({
+				author: selectedAiWbwTranslationEdition()?.author ?? '',
+				language: selectedAiWbwTranslationEdition()?.language ?? ''
+			})}
+		</div>
+	{/snippet}
+
+	{#snippet afterStatus()}
+		<AiStreamingWorkerGrid {workers} />
+	{/snippet}
+</TranslationsEditorModalShell>

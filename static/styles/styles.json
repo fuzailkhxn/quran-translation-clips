@@ -1,0 +1,1435 @@
+[
+	{
+		"id": "general",
+		"name": "General",
+		"description": "General styling options for subtitles",
+		"icon": "settings",
+		"ui": {
+			"panel": { "id": "essentials", "icon": "text_fields", "label": "text", "order": 0, "categoryOrder": 0 },
+			"groups": [
+				{
+					"id": "basics",
+					"styleIds": [
+						"show-subtitles",
+						"riwayah",
+						"mushaf-style",
+						"basmala-style",
+						"basmala-scale",
+						"istiadha-style",
+						"istiadha-scale",
+						"text-direction"
+					]
+				},
+				{
+					"id": "verseNumber",
+					"styleIds": [
+						"show-verse-number",
+						"verse-number-new-line",
+						"verse-number-format",
+						"verse-number-position",
+						"verse-number-numeral-system"
+					]
+				},
+				{
+					"id": "decorations",
+					"styleIds": ["show-decorative-brackets", "decorative-brackets-font-family"]
+				}
+			]
+		},
+		"styles": [
+			{
+				"id": "show-subtitles",
+				"name": "Show Subtitles",
+				"description": "Toggle the visibility of subtitles",
+				"value": true,
+				"valueType": "boolean",
+				"css": "",
+				"tailwind": false,
+				"icon": "visibility"
+			},
+			{
+				"id": "show-verse-number",
+				"name": "Show Verse Number",
+				"description": "Toggle the visibility of verse numbers",
+				"value": true,
+				"valueType": "boolean",
+				"css": "",
+				"tailwind": false,
+				"icon": "123"
+			},
+			{
+				"id": "verse-number-new-line",
+				"name": "Verse Number on New Line",
+				"description": "Always place the verse number on a new line",
+				"value": false,
+				"valueType": "boolean",
+				"css": "",
+				"tailwind": false,
+				"icon": "keyboard_return"
+			},
+			{
+				"id": "text-direction",
+				"name": "Right-to-Left",
+				"description": "Set the text direction to Right-to-Left",
+				"value": false,
+				"valueType": "boolean",
+				"css": "direction: rtl;",
+				"tailwind": false,
+				"icon": "format_align_right"
+			},
+			{
+				"id": "show-decorative-brackets",
+				"name": "Decorative Brackets",
+				"description": "Wrap Arabic subtitle text with decorative brackets",
+				"value": false,
+				"valueType": "boolean",
+				"css": "",
+				"tailwind": false,
+				"icon": "format_quote"
+			},
+			{
+				"id": "decorative-brackets-font-family",
+				"name": "Decorative Brackets Style",
+				"description": "Choose the glyph pair used for decorative brackets (opening first, closing second). Uses QPC2BSML font.",
+				"value": "LM",
+				"valueType": "brackets-font",
+				"options": [
+					"LM",
+					"NO",
+					"PQ",
+					"RS",
+					"TU",
+					"VW",
+					"XY",
+					"Z:",
+					"()"
+				],
+				"css": "",
+				"tailwind": false,
+				"icon": "font_download"
+			},
+			{
+				"id": "riwayah",
+				"name": "Riwayah",
+				"description": "Choose the Quran recitation used for Arabic subtitles.",
+				"value": "Hafs",
+				"valueType": "select",
+				"options": ["Hafs", "Warsh", "Qaloon", "Shouba", "Doori", "Soosi", "Bazzi", "Qumbul"],
+				"css": "",
+				"tailwind": false,
+				"icon": "menu_book"
+			},
+			{
+				"id": "mushaf-style",
+				"name": "Mushaf",
+				"description": "Choose the Arabic script source for Quran subtitles.",
+				"value": "Uthmani",
+				"valueType": "select",
+				"options": ["Uthmani", "Indopak", "Tajweed", "Minimal Quran"],
+				"css": "",
+				"tailwind": false,
+				"icon": "menu_book"
+			},
+			{
+				"id": "basmala-style",
+				"name": "Basmala Style",
+				"description": "Use the current Arabic font or choose one of 122 calligraphic basmalas.",
+				"value": "current-font",
+				"valueType": "select",
+				"options": [
+					"current-font",
+					"1", "2", "3", "4", "5", "6", "7", "8", "9", "10",
+					"11", "12", "13", "14", "15", "16", "17", "18", "19", "20",
+					"21", "22", "23", "24", "25", "26", "27", "28", "29", "30",
+					"31", "32", "33", "34", "35", "36", "37", "38", "39", "40",
+					"41", "42", "43", "44", "45", "46", "47", "48", "49", "50",
+					"51", "52", "53", "54", "55", "56", "57", "58", "59", "60",
+					"61", "62", "63", "64", "65", "66", "67", "68", "69", "70",
+					"71", "72", "73", "74", "75", "76", "77", "78", "79", "80",
+					"81", "82", "83", "84", "85", "86", "87", "88", "89", "90",
+					"91", "92", "93", "94", "95", "96", "97", "98", "99", "100",
+					"101", "102", "103", "104", "105", "106", "107", "108", "109", "110",
+					"111", "112", "113", "114", "115", "116", "117", "118", "119", "120",
+					"121", "122"
+				],
+				"css": "",
+				"tailwind": false,
+				"icon": "auto_awesome"
+			},
+			{
+				"id": "basmala-scale",
+				"name": "Basmala Scale",
+				"description": "Scale calligraphic predefined basmalas independently from other subtitles.",
+				"value": 100,
+				"valueType": "number",
+				"valueMin": 75,
+				"valueMax": 400,
+				"step": 1,
+				"css": "",
+				"tailwind": false,
+				"icon": "zoom_in"
+			},
+			{
+				"id": "istiadha-style",
+				"name": "Istiadha Style",
+				"description": "Use the current Arabic font or choose one of 16 calligraphic istiʿādhas.",
+				"value": "current-font",
+				"valueType": "select",
+				"options": [
+					"current-font",
+					"1", "2", "3", "4", "5", "6", "7", "8", "9", "10",
+					"11", "12", "13", "14", "15", "16"
+				],
+				"css": "",
+				"tailwind": false,
+				"icon": "auto_awesome"
+			},
+			{
+				"id": "istiadha-scale",
+				"name": "Istiadha Scale",
+				"description": "Scale calligraphic predefined istiʿādhas independently from other subtitles.",
+				"value": 100,
+				"valueType": "number",
+				"valueMin": 75,
+				"valueMax": 400,
+				"step": 1,
+				"css": "",
+				"tailwind": false,
+				"icon": "zoom_in"
+			},
+			{
+				"id": "verse-number-format",
+				"name": "Verse Number Format",
+				"description": "Change the format of verse numbers. Supported tags: <number>, <br>.",
+				"value": "<number>. ",
+				"valueType": "text",
+				"css": "",
+				"tailwind": false,
+				"icon": "text_format"
+			},
+			{
+				"id": "verse-number-position",
+				"name": "Verse Number Position",
+				"description": "Set the position of verse numbers",
+				"value": "before",
+				"valueType": "select",
+				"options": [
+					"before",
+					"after"
+				],
+				"css": "",
+				"tailwind": false,
+				"icon": "123"
+			},
+			{
+				"id": "verse-number-numeral-system",
+				"name": "Verse Number Numerals",
+				"description": "Choose how verse number digits are written in translations.",
+				"value": "Western Arabic",
+				"valueType": "select",
+				"options": [
+					"Western Arabic",
+					"Arabic-Indic",
+					"Persian",
+					"Urdu",
+					"Bengali",
+					"Hindi"
+				],
+				"css": "",
+				"tailwind": false,
+				"icon": "pin"
+			}
+		]
+	},
+	{
+		"id": "text",
+		"name": "Text Styling",
+		"description": "Control the appearance and formatting of subtitle text",
+		"icon": "text_fields",
+		"ui": {
+			"panel": { "id": "essentials", "icon": "text_fields", "label": "text", "order": 0, "categoryOrder": 1 },
+			"groups": [
+				{
+					"id": "typography",
+					"styleIds": [
+						"font-family",
+						"font-size",
+						"font-weight",
+						"enable-italic",
+						"text-transform"
+					]
+				},
+				{
+					"id": "colors",
+					"styleIds": ["text-color", "verse-number-color", "opacity"]
+				},
+				{
+					"id": "spacing",
+					"styleIds": [
+					"letter-spacing",
+					"word-spacing",
+					"line-height",
+					"max-height",
+					"max-line",
+					"vertical-text-alignment"
+				],
+				"shared": true
+			}
+			]
+		},
+		"styles": [
+		{
+			"id": "text-color",
+			"name": "Text Color",
+			"description": "Change the color of the text",
+			"value": "#ffffff",
+			"valueType": "color",
+			"css": "color: {value};",
+			"tailwind": false,
+			"icon": "palette"
+		},
+		{
+			"id": "verse-number-color",
+			"name": "Verse Number Color",
+			"description": "Change the color of the verse number",
+			"value": "#ffffff",
+			"valueType": "color",
+			"css": "--verse-number-color: {value};",
+			"tailwind": false,
+			"icon": "palette"
+		},
+		{
+			"id": "font-size",
+				"name": "Font Size",
+				"description": "Adjust the size of the text",
+				"value": 60,
+				"valueType": "number",
+				"valueMin": 16,
+				"valueMax": 200,
+				"css": "font-size: {value}px;",
+				"tailwind": false,
+				"icon": "format_size"
+			},
+			{
+				"id": "font-family",
+				"name": "Font Family",
+				"description": "Select the font family for the text",
+				"value": "Candara",
+				"valueType": "select",
+				"options": [],
+				"css": "font-family: '{value}', sans-serif;",
+				"tailwind": false,
+				"icon": "font_download"
+			},
+			{
+				"id": "font-weight",
+				"name": "Font Weight",
+				"description": "Set the thickness of the font",
+				"value": "normal",
+				"valueType": "select",
+				"options": [
+					"normal",
+					"bold",
+					"lighter",
+					"bolder"
+				],
+				"css": "font-weight: {value};",
+				"tailwind": false,
+				"icon": "format_bold"
+			},
+			{
+				"id": "enable-italic",
+				"name": "Enable Italic",
+				"description": "Enable italic styling for the text",
+				"value": false,
+				"valueType": "boolean",
+				"css": "font-style: italic;",
+				"tailwind": false,
+				"icon": "format_italic"
+			},
+			{
+				"id": "text-transform",
+				"name": "Text Transform",
+				"description": "Transform the case of the text",
+				"value": "none",
+				"valueType": "select",
+				"options": [
+					"none",
+					"uppercase",
+					"lowercase",
+					"capitalize"
+				],
+				"css": "text-transform: {value};",
+				"tailwind": false,
+				"icon": "text_format"
+			},
+			{
+				"id": "letter-spacing",
+				"name": "Letter Spacing",
+				"description": "Adjust spacing between characters",
+				"value": 0,
+				"valueType": "number",
+				"valueMin": -30,
+				"valueMax": 20,
+				"css": "letter-spacing: {value}px;",
+				"tailwind": false,
+				"icon": "horizontal_distribute"
+			},
+			{
+				"id": "word-spacing",
+				"name": "Word Spacing",
+				"description": "Adjust spacing between words",
+				"value": 0,
+				"valueType": "number",
+				"valueMin": -30,
+				"valueMax": 60,
+				"css": "word-spacing: {value}px;",
+				"tailwind": false,
+				"icon": "horizontal_distribute"
+			},
+			{
+				"id": "line-height",
+				"name": "Line Height",
+				"description": "Adjust spacing between lines",
+				"value": 1.2,
+				"valueType": "number",
+				"valueMin": 0.8,
+				"valueMax": 3,
+				"step": 0.1,
+				"css": "line-height: {value};",
+				"tailwind": false,
+				"icon": "format_line_spacing"
+			},
+			{
+				"id": "max-height",
+				"name": "Max Height (Make Text Fit)",
+				"description": "Limit text height and auto-adjust font size to fit. 0 = no limit.",
+				"value": 0,
+				"valueType": "number",
+				"valueMin": 0,
+				"valueMax": 800,
+				"css": "max-height: {value}px; height: {value}px;",
+				"tailwind": false,
+				"icon": "height"
+			},
+			{
+				"id": "max-line",
+				"name": "Max Line",
+				"description": "Limit text to a maximum number of rendered lines. Infinite = no limit.",
+				"value": "Infinite",
+				"valueType": "select",
+				"options": [
+					"1",
+					"2",
+					"3",
+					"4",
+					"Infinite"
+				],
+				"css": "",
+				"tailwind": false,
+				"icon": "format_line_spacing"
+			},
+			{
+				"id": "reactive-font-size",
+				"name": "Reactive Font Size",
+				"description": "Used by the 'Make Text Fit' feature to adjust font size based on container size",
+				"value": "none",
+				"valueType": "number",
+				"valueMin": 10,
+				"valueMax": 100,
+				"step": 1,
+				"css": "font-size: {value}px !important;",
+				"tailwind": false,
+				"icon": "height"
+			}
+		]
+	},
+	{
+		"id": "word-by-word-highlight",
+		"name": "WBW Effect",
+		"description": "Apply timed word-by-word effects when WBW timestamps are available",
+		"icon": "lyrics",
+		"ui": {
+			"panel": { "id": "word-by-word", "icon": "format_paint", "label": "word-by-word-highlight", "order": 4, "categoryOrder": 0 },
+			"groups": [
+				{
+					"id": "basics",
+					"styleIds": [
+						"wbw-show-current-word-only",
+						"wbw-reveal-on-recitation",
+						"wbw-always-show-verse-number",
+						"wbw-reveal-specific-word-style",
+						"wbw-keep-specific-word-style",
+						"wbw-persist-color"
+					]
+				},
+				{
+					"id": "colors",
+					"styleIds": ["enable-wbw-highlight", "wbw-color"]
+				},
+				{
+					"id": "decorations",
+					"styleIds": [
+						"enable-wbw-underline",
+						"wbw-underline-thickness",
+						"enable-wbw-glow",
+						"wbw-glow-color",
+						"wbw-glow-blur",
+						"enable-wbw-background",
+						"wbw-bg-color",
+						"enable-wbw-line-background",
+						"wbw-line-background-color",
+						"wbw-line-background-position",
+						"wbw-line-background-height",
+						"wbw-line-background-padding",
+						"enable-wbw-current-word-opacity",
+						"wbw-current-word-opacity"
+					]
+				},
+				{
+					"id": "advanced",
+					"styleIds": ["wbw-current-word-custom-css"]
+				}
+			]
+		},
+		"styles": [
+			{
+				"id": "wbw-show-current-word-only",
+				"name": "Show current word only",
+				"description": "Show only the word currently being recited",
+				"value": false,
+				"valueType": "boolean",
+				"css": "",
+				"tailwind": false,
+				"icon": "filter_1"
+			},
+			{
+				"id": "enable-wbw-highlight",
+				"name": "Enable wbw highlight",
+				"description": "Enable or disable timed word-by-word highlighting",
+				"value": false,
+				"valueType": "boolean",
+				"css": "",
+				"tailwind": false,
+				"icon": "toggle_on"
+			},
+			{
+				"id": "wbw-color",
+				"name": "Word-by-word color",
+				"description": "Color applied to highlighted words",
+				"value": "#facc15",
+				"valueType": "color",
+				"css": "",
+				"tailwind": false,
+				"icon": "palette"
+			},
+			{
+				"id": "wbw-persist-color",
+				"name": "Persist WBW effect",
+				"description": "Keep the active WBW effect on previously recited words",
+				"value": false,
+				"valueType": "boolean",
+				"css": "",
+				"tailwind": false,
+				"icon": "format_color_fill"
+			},
+			{
+				"id": "enable-wbw-underline",
+				"name": "Enable underline",
+				"description": "Underline highlighted words",
+				"value": false,
+				"valueType": "boolean",
+				"css": "",
+				"tailwind": false,
+				"icon": "format_underlined"
+			},
+			{
+				"id": "wbw-underline-thickness",
+				"name": "Underline thickness",
+				"description": "Thickness of the wbw underline in pixels",
+				"value": 5,
+				"valueType": "number",
+				"valueMin": 1,
+				"valueMax": 12,
+				"step": 1,
+				"css": "",
+				"tailwind": false,
+				"icon": "line_weight"
+			},
+			{
+				"id": "enable-wbw-glow",
+				"name": "Enable wbw glow",
+				"description": "Add a glow around highlighted words",
+				"value": false,
+				"valueType": "boolean",
+				"css": "",
+				"tailwind": false,
+				"icon": "flare"
+			},
+			{
+				"id": "wbw-glow-color",
+				"name": "Glow color",
+				"description": "Glow color applied to highlighted words",
+				"value": "#facc15",
+				"valueType": "color",
+				"css": "",
+				"tailwind": false,
+				"icon": "palette"
+			},
+			{
+				"id": "wbw-glow-blur",
+				"name": "Glow blur",
+				"description": "Set the blur radius of the wbw glow",
+				"value": 10,
+				"valueType": "number",
+				"valueMin": 0,
+				"valueMax": 50,
+				"step": 1,
+				"css": "",
+				"tailwind": false,
+				"icon": "blur_on"
+			},
+			{
+				"id": "wbw-reveal-on-recitation",
+				"name": "Reveal words on recitation",
+				"description": "Keep future words hidden until they are recited, then fade them up to the Arabic opacity",
+				"value": false,
+				"valueType": "boolean",
+				"css": "",
+				"tailwind": false,
+				"icon": "visibility_off"
+			},
+			{
+				"id": "wbw-always-show-verse-number",
+				"name": "Always Show Verse Number",
+				"description": "Keep the verse number visible at all times during word-by-word highlighting. When disabled, the verse number fades in together with the last word of the verse.",
+				"value": false,
+				"valueType": "boolean",
+				"css": "",
+				"tailwind": false,
+				"icon": "123"
+			},
+			{
+				"id": "enable-wbw-background",
+				"name": "Enable wbw background",
+				"description": "Enable a background color behind highlighted words",
+				"value": false,
+				"valueType": "boolean",
+				"css": "",
+				"tailwind": false,
+				"icon": "highlight"
+			},
+			{
+				"id": "wbw-bg-color",
+				"name": "Background color",
+				"description": "Background color applied to highlighted words",
+				"value": "#2d2a14",
+				"valueType": "color",
+				"css": "",
+				"tailwind": false,
+				"icon": "highlight"
+			},
+			{
+				"id": "enable-wbw-line-background",
+				"name": "Enable WBW Line Background",
+				"description": "Highlight recited words with the rounded line background style",
+				"value": false,
+				"valueType": "boolean",
+				"css": "",
+				"tailwind": false,
+				"icon": "view_stream"
+			},
+			{
+				"id": "wbw-line-background-color",
+				"name": "WBW Bar Color",
+				"description": "Color applied to the line background of highlighted words",
+				"value": "#facc15",
+				"valueType": "color",
+				"css": "",
+				"tailwind": false,
+				"icon": "palette"
+			},
+			{
+				"id": "wbw-line-background-position",
+				"name": "WBW Bar Position",
+				"description": "Adjust the WBW bar position when the subtitle line background is disabled",
+				"value": 15,
+				"valueType": "number",
+				"valueMin": -100,
+				"valueMax": 100,
+				"step": 1,
+				"css": "",
+				"tailwind": false,
+				"icon": "height"
+			},
+			{
+				"id": "wbw-line-background-height",
+				"name": "WBW Bar Height",
+				"description": "Adjust the WBW bar height when the subtitle line background is disabled",
+				"value": 50,
+				"valueType": "number",
+				"valueMin": 1,
+				"valueMax": 200,
+				"step": 1,
+				"css": "",
+				"tailwind": false,
+				"icon": "line_weight"
+			},
+			{
+				"id": "wbw-line-background-padding",
+				"name": "WBW Bar Horizontal Padding",
+				"description": "Add equal horizontal spacing to both ends of the WBW bar",
+				"value": 0,
+				"valueType": "number",
+				"valueMin": 0,
+				"valueMax": 100,
+				"step": 1,
+				"css": "",
+				"tailwind": false,
+				"icon": "space_bar"
+			},
+			{
+				"id": "enable-wbw-current-word-opacity",
+				"name": "Enable current word opacity",
+				"description": "Override the opacity of the current WBW word",
+				"value": false,
+				"valueType": "boolean",
+				"css": "",
+				"tailwind": false,
+				"icon": "toggle_on"
+			},
+			{
+				"id": "wbw-current-word-opacity",
+				"name": "Current word opacity",
+				"description": "Opacity applied to the current WBW word",
+				"value": 1,
+				"valueType": "number",
+				"valueMin": 0,
+				"valueMax": 1,
+				"step": 0.05,
+				"css": "",
+				"tailwind": false,
+				"icon": "opacity"
+			},
+			{
+				"id": "wbw-reveal-specific-word-style",
+				"name": "Reveal specific word style on recitation",
+				"description": "Hide custom word styles until their linked word is recited",
+				"value": false,
+				"valueType": "boolean",
+				"css": "",
+				"tailwind": false,
+				"icon": "format_paint"
+			},
+			{
+				"id": "wbw-keep-specific-word-style",
+				"name": "Keep specific word style after revelation",
+				"description": "Keep custom word styles visible after their linked words are recited",
+				"value": true,
+				"valueType": "boolean",
+				"css": "",
+				"tailwind": false,
+				"icon": "format_paint"
+			},
+			{
+				"id": "wbw-current-word-custom-css",
+				"name": "Custom CSS (current word)",
+				"description": "Custom CSS applied to the current WBW word",
+				"value": "",
+				"valueType": "text",
+				"css": "",
+				"tailwind": false,
+				"icon": "code"
+			}
+		]
+	},
+	{
+		"id": "positioning",
+		"name": "Position & Layout",
+		"description": "Control the position and spacing of subtitles on screen",
+		"icon": "open_with",
+		"ui": {
+			"panel": { "id": "layout", "icon": "open_with", "label": "positioning", "order": 1, "categoryOrder": 0 },
+			"layerControl": true
+		},
+		"styles": [
+			{
+				"id": "reactive-y-position",
+				"name": "Reactive Y Position",
+				"description": "Used if the 'Make Text Fit' feature is not set to adjust Y position based on other subtitles positions so that they do not overlap",
+				"value": 0,
+				"valueType": "number",
+				"valueMin": -600,
+				"valueMax": 600,
+				"step": 1,
+				"css": "--reactive-y-position: {value}px;",
+				"tailwind": false,
+				"icon": "height"
+			},
+			{
+				"id": "vertical-position",
+				"name": "Vertical Position",
+				"description": "Change the vertical position of the text (pixels from center)",
+				"value": 0,
+				"valueType": "number",
+				"valueMin": -540,
+				"valueMax": 540,
+				"css": "--translate-y: calc({value}px + var(--reactive-y-position));",
+				"tailwind": false,
+				"icon": "vertical_align_center"
+			},
+			{
+				"id": "horizontal-position",
+				"name": "Horizontal Position",
+				"description": "Change the horizontal position of the text (pixels from center)",
+				"value": 0,
+				"valueType": "number",
+				"valueMin": -960,
+				"valueMax": 960,
+				"css": "--translate-x: {value}px; transform: translate(var(--translate-x), var(--translate-y)) rotate(var(--rotation)) scale(var(--scale));",
+				"tailwind": false,
+				"icon": "horizontal_rule"
+			},
+			{
+				"id": "width",
+				"name": "Width",
+				"description": "Set width of subtitle container",
+				"value": 80,
+				"valueType": "number",
+				"valueMin": 10,
+				"valueMax": 100,
+				"css": "width: {value}%;",
+				"tailwind": false,
+				"icon": "width_full"
+			},
+			{
+				"id": "horizontal-text-alignment",
+				"name": "Horizontal Text Alignment",
+				"description": "Set the alignment of the text",
+				"value": "center",
+				"valueType": "select",
+				"options": [
+					"left",
+					"center",
+					"right",
+					"justify"
+				],
+				"css": {
+					"left": "text-align: left; justify-content: flex-start;",
+					"center": "text-align: center; justify-content: center;",
+					"right": "text-align: right; justify-content: flex-end;",
+					"justify": "text-align: justify; justify-content: space-between;"
+				},
+				"tailwind": false,
+				"icon": "format_align_center"
+			},
+			{
+				"id": "vertical-text-alignment",
+				"name": "Vertical Text Alignment",
+				"description": "Align text vertically when paragraph height is large",
+				"value": "center",
+				"valueType": "select",
+				"options": [
+					"top",
+					"center",
+					"bottom"
+				],
+				"css": {
+					"top": "display: flex; align-items: flex-start;",
+					"center": "display: flex; align-items: center;",
+					"bottom": "display: flex; align-items: flex-end;"
+				},
+				"tailwind": false,
+				"icon": "vertical_align_center"
+			}
+		]
+	},
+	{
+		"id": "background",
+		"name": "Background & Container",
+		"description": "Style the background and container of subtitles",
+		"icon": "square",
+		"ui": {
+			"panel": { "id": "appearance", "icon": "format_color_fill", "label": "background", "order": 2, "categoryOrder": 0 },
+			"headerStyle": "background-enable",
+			"groups": [
+				{
+					"id": "layout",
+				"styleIds": ["max-height", "width", "vertical-text-alignment"],
+					"shared": true
+				},
+				{
+					"id": "basics",
+					"styleIds": ["background-enable", "background-color", "background-opacity"]
+				},
+				{
+					"id": "spacing",
+					"styleIds": ["border-radius", "background-horizontal-padding"]
+				},
+				{
+					"id": "timing",
+					"styleIds": ["always-show", "time-ranges", "time-appearance", "time-disappearance"]
+				},
+				{ "id": "advanced", "styleIds": ["background-css"] }
+			]
+		},
+		"styles": [
+			{
+				"id": "background-enable",
+				"name": "Enable Background",
+				"description": "Enable or disable background styling",
+				"value": false,
+				"valueType": "boolean",
+				"css": "",
+				"tailwind": false,
+				"icon": "toggle_on"
+			},
+			{
+				"id": "always-show",
+				"name": "Always Show",
+				"description": "Always show the background (ignore timing)",
+				"value": true,
+				"valueType": "boolean",
+				"css": "",
+				"tailwind": false,
+				"icon": "visibility"
+			},
+			{
+				"id": "time-ranges",
+				"name": "Time Ranges",
+				"description": "Configure multiple appearance ranges",
+				"value": [{ "startTime": 0, "endTime": 10000 }],
+				"valueType": "time-ranges",
+				"css": "",
+				"tailwind": false,
+				"icon": "access_time"
+			},
+			{
+				"id": "time-appearance",
+				"name": "Time Appearance",
+				"description": "Change the time where the background appears",
+				"value": 0,
+				"valueType": "time",
+				"css": "",
+				"tailwind": false,
+				"icon": "access_time"
+			},
+			{
+				"id": "time-disappearance",
+				"name": "Time Disappearance",
+				"description": "Change the time where the background disappears",
+				"value": 10000,
+				"valueType": "time",
+				"css": "",
+				"tailwind": false,
+				"icon": "access_time"
+			},
+			{
+				"id": "background-color",
+				"name": "Background Color",
+				"description": "Add a background color behind the text",
+				"value": "rgba(0,0,0,0.8)",
+				"valueType": "color",
+				"css": "",
+				"tailwind": false,
+				"icon": "format_color_fill"
+			},
+			{
+				"id": "background-opacity",
+				"name": "Background Opacity",
+				"description": "Control the transparency of the background",
+				"value": 80,
+				"valueType": "number",
+				"valueMin": 0,
+				"valueMax": 1,
+				"step": 0.01,
+				"css": "--background-opacity: {value};",
+				"tailwind": false,
+				"icon": "opacity"
+			},
+			{
+				"id": "border-radius",
+				"name": "Border Radius",
+				"description": "Round the corners of the background",
+				"value": 8,
+				"valueType": "number",
+				"valueMin": 0,
+				"valueMax": 100,
+				"css": "border-radius: {value}px;",
+				"tailwind": false,
+				"icon": "rounded_corner"
+			},
+			{
+				"id": "background-horizontal-padding",
+				"name": "Horizontal Padding",
+				"description": "Add left and right padding when using a background",
+				"value": 0,
+				"valueType": "number",
+				"valueMin": 0,
+				"valueMax": 200,
+				"css": "padding-left: {value}px; padding-right: {value}px;",
+				"tailwind": false,
+				"icon": "padding"
+			},
+			{
+				"id": "background-css",
+				"name": "Custom CSS for Background",
+				"description": "Write any CSS for custom Background (gradient, pattern, ...). Use !important if needed. Exemple: background: linear-gradient(to right, #ff0000, #0000ff) !important;",
+				"value": "",
+				"valueType": "text",
+				"css": "{value}",
+				"tailwind": false,
+				"icon": "code"
+			}
+		]
+	},
+	{
+		"id": "border",
+		"name": "Container Border",
+		"description": "Add borders around subtitle containers",
+		"icon": "border_all",
+		"ui": {
+			"panel": { "id": "appearance", "icon": "format_color_fill", "label": "background", "order": 2, "categoryOrder": 1 },
+			"headerStyle": "border-enable"
+		},
+		"styles": [
+			{
+				"id": "border-enable",
+				"name": "Enable Border",
+				"description": "Enable or disable container border",
+				"value": false,
+				"valueType": "boolean",
+				"css": "",
+				"tailwind": false,
+				"icon": "toggle_on"
+			},
+			{
+				"id": "border-width",
+				"name": "Border Width",
+				"description": "Set the width of the border",
+				"value": 2,
+				"valueType": "number",
+				"valueMin": 0,
+				"valueMax": 20,
+				"step": 0.5,
+				"css": "border: {value}px solid;",
+				"tailwind": false,
+				"icon": "line_weight"
+			},
+			{
+				"id": "border-color",
+				"name": "Border Color",
+				"description": "Set the color of the border",
+				"value": "#ffffff",
+				"valueType": "color",
+				"css": "border-color: {value};",
+				"tailwind": false,
+				"icon": "palette"
+			},
+			{
+				"id": "border-style",
+				"name": "Border Style",
+				"description": "Choose the style of the border",
+				"value": "solid",
+				"valueType": "select",
+				"options": [
+					"solid",
+					"dashed",
+					"dotted",
+					"double",
+					"groove",
+					"ridge"
+				],
+				"css": "border-style: {value};",
+				"tailwind": false,
+				"icon": "more_horiz"
+			}
+		]
+	},
+	{
+		"id": "shadow",
+		"name": "Shadow Effects",
+		"description": "Add shadow effects to text and containers",
+		"icon": "filter_drama",
+		"ui": {
+			"panel": { "id": "effects", "icon": "auto_fix_high", "label": "effects", "order": 3, "categoryOrder": 3 },
+			"headerStyle": "shadow-enable"
+		},
+		"styles": [
+			{
+				"id": "shadow-enable",
+				"name": "Enable Shadows",
+				"description": "Enable or disable shadow effects",
+				"value": false,
+				"valueType": "boolean",
+				"css": "",
+				"tailwind": false,
+				"icon": "toggle_on"
+			},
+			{
+				"id": "text-shadow",
+				"name": "Text Shadow",
+				"description": "Add shadow effect to the text",
+				"value": 4,
+				"valueType": "number",
+				"valueMin": 0,
+				"valueMax": 20,
+				"css": "--text-drop-shadow: {value}px {value}px 8px var(--text-shadow-color); text-shadow: var(--wbw-word-glow-shadow, 0 0 0 transparent), var(--inline-word-glow-shadow, 0 0 0 transparent), var(--text-neon-shadow, 0 0 0 transparent), var(--text-glow-shadow, 0 0 0 transparent), var(--text-drop-shadow, 0 0 0 transparent);",
+				"tailwind": false,
+				"icon": "text_fields"
+			},
+			{
+				"id": "text-shadow-color",
+				"name": "Text Shadow Color",
+				"description": "Set the color of the text shadow",
+				"value": "#000000",
+				"valueType": "color",
+				"css": "--text-shadow-color: {value};",
+				"tailwind": false,
+				"icon": "palette"
+			},
+			{
+				"id": "box-shadow",
+				"name": "Container Shadow",
+				"description": "Add shadow to the subtitle container",
+				"value": 0,
+				"valueType": "number",
+				"valueMin": 0,
+				"valueMax": 40,
+				"css": "box-shadow: 0 {value}px {value}px var(--box-shadow-color);",
+				"tailwind": false,
+				"icon": "square"
+			},
+			{
+				"id": "box-shadow-color",
+				"name": "Container Shadow Color",
+				"description": "Set the color of the container shadow",
+				"value": "#000000",
+				"valueType": "color",
+				"css": "--box-shadow-color: {value};",
+				"tailwind": false,
+				"icon": "palette"
+			}
+		]
+	},
+	{
+		"id": "outline",
+		"name": "Text Outline",
+		"description": "Add outlines and strokes around text",
+		"icon": "border_outer",
+		"ui": {
+			"panel": { "id": "appearance", "icon": "format_color_fill", "label": "background", "order": 2, "categoryOrder": 3 },
+			"headerStyle": "outline-enable"
+		},
+		"styles": [
+			{
+				"id": "outline-enable",
+				"name": "Enable Outline",
+				"description": "Enable or disable text outline",
+				"value": false,
+				"valueType": "boolean",
+				"css": "",
+				"tailwind": false,
+				"icon": "toggle_on"
+			},
+			{
+				"id": "text-outline",
+				"name": "Outline Width",
+				"description": "Set the width of the text outline",
+				"value": 0.25,
+				"valueType": "number",
+				"valueMin": 0,
+				"valueMax": 20,
+				"step": 0.01,
+				"css": "-webkit-text-stroke: calc({value}px * 2) var(--text-outline-color); paint-order: stroke fill;",
+				"tailwind": false,
+				"icon": "line_weight"
+			},
+			{
+				"id": "text-outline-color",
+				"name": "Outline Color",
+				"description": "Set the color of the text outline",
+				"value": "#000000",
+				"valueType": "color",
+				"css": "--text-outline-color: {value};",
+				"tailwind": false,
+				"icon": "palette"
+			}
+		]
+	},
+	{
+		"id": "line-background",
+		"name": "Line Background",
+		"description": "Add a rounded background bar behind each subtitle line",
+		"icon": "view_stream",
+		"ui": {
+			"panel": { "id": "effects", "icon": "auto_fix_high", "label": "effects", "order": 3, "categoryOrder": 2 },
+			"headerStyle": "line-background-enable"
+		},
+		"styles": [
+			{
+				"id": "line-background-enable",
+				"name": "Enable Line Background",
+				"description": "Enable or disable the background bar behind each subtitle line",
+				"value": false,
+				"valueType": "boolean",
+				"css": "",
+				"tailwind": false,
+				"icon": "toggle_on"
+			},
+			{
+				"id": "line-background-color",
+				"name": "Bar Color",
+				"description": "Set the color of the background bar",
+				"value": "#f5deb3",
+				"valueType": "color",
+				"css": "--line-background-color: {value};",
+				"tailwind": false,
+				"icon": "palette"
+			},
+			{
+				"id": "line-background-position",
+				"name": "Bar Position",
+				"description": "Adjust the vertical position of the background bar relative to the text",
+				"value": 15,
+				"valueType": "number",
+				"valueMin": -100,
+				"valueMax": 100,
+				"step": 1,
+				"css": "--line-background-position: {value}px;",
+				"tailwind": false,
+				"icon": "height"
+			},
+			{
+				"id": "line-background-height",
+				"name": "Bar Height",
+				"description": "Adjust the height of the background bar",
+				"value": 50,
+				"valueType": "number",
+				"valueMin": 1,
+				"valueMax": 200,
+				"step": 1,
+				"css": "--line-background-height: {value}px;",
+				"tailwind": false,
+				"icon": "line_weight"
+			},
+			{
+				"id": "line-background-roundness",
+				"name": "Bar Roundness (%)",
+				"description": "Adjust corner roundness: 0% for square corners, 100% for fully rounded ends",
+				"value": 100,
+				"valueType": "number",
+				"valueMin": 0,
+				"valueMax": 100,
+				"step": 1,
+				"css": "--line-background-roundness: {value};",
+				"tailwind": false,
+				"icon": "rounded_corner"
+			}
+		]
+	},
+	{
+		"id": "text-glow",
+		"name": "Text Glow",
+		"description": "Add a glow effect to the text",
+		"icon": "wb_incandescent",
+		"ui": {
+			"panel": { "id": "effects", "icon": "auto_fix_high", "label": "effects", "order": 3, "categoryOrder": 0 },
+			"headerStyle": "text-glow-enable"
+		},
+		"styles": [
+			{
+				"id": "text-glow-enable",
+				"name": "Enable Glow",
+				"description": "Enable or disable text glow",
+				"value": false,
+				"valueType": "boolean",
+				"css": "",
+				"tailwind": false,
+				"icon": "toggle_on"
+			},
+			{
+				"id": "text-glow-color",
+				"name": "Glow Color",
+				"description": "Set the color of the text glow",
+				"value": "#ffffff",
+				"valueType": "color",
+				"css": "--text-glow-color: {value}; --text-glow-shadow: 0 0 calc(var(--text-glow-blur) * 0.5) var(--text-glow-color), 0 0 var(--text-glow-blur) var(--text-glow-color), 0 0 calc(var(--text-glow-blur) * 2) var(--text-glow-color); text-shadow: var(--wbw-word-glow-shadow, 0 0 0 transparent), var(--inline-word-glow-shadow, 0 0 0 transparent), var(--text-neon-shadow, 0 0 0 transparent), var(--text-glow-shadow, 0 0 0 transparent), var(--text-drop-shadow, 0 0 0 transparent);",
+				"tailwind": false,
+				"icon": "palette"
+			},
+			{
+				"id": "text-glow-blur",
+				"name": "Glow Blur",
+				"description": "Set the blur radius of the text glow",
+				"value": 10,
+				"valueType": "number",
+				"valueMin": 0,
+				"valueMax": 50,
+				"css": "--text-glow-blur: {value}px;",
+				"tailwind": false,
+				"icon": "blur_on"
+			}
+		]
+	},
+	{
+		"id": "text-neon",
+		"name": "Neon Effect",
+		"description": "Add a neon light effect to the text",
+		"icon": "light_mode",
+		"ui": {
+			"panel": { "id": "effects", "icon": "auto_fix_high", "label": "effects", "order": 3, "categoryOrder": 1 },
+			"headerStyle": "text-neon-enable"
+		},
+		"styles": [
+			{
+				"id": "text-neon-enable",
+				"name": "Enable Neon Effect",
+				"description": "Enable or disable neon effect",
+				"value": false,
+				"valueType": "boolean",
+				"css": "",
+				"tailwind": false,
+				"icon": "toggle_on"
+			},
+			{
+				"id": "text-neon-color",
+				"name": "Neon Color",
+				"description": "Set the color of the neon effect",
+				"value": "#00ff00",
+				"valueType": "color",
+				"css": "--text-neon-color: {value};",
+				"tailwind": false,
+				"icon": "palette"
+			},
+			{
+				"id": "text-intensity",
+				"name": "Neon Intensity",
+				"description": "Set the intensity of the neon effect",
+				"value": 10,
+				"valueType": "number",
+				"valueMin": 0,
+				"valueMax": 50,
+				"css": "--text-neon-size: {value}px; color: color-mix(in srgb, var(--text-neon-color) 20%, white); --text-neon-shadow: 0 0 calc(var(--text-neon-size) * 0.25) var(--text-neon-color), 0 0 calc(var(--text-neon-size) * 0.75) var(--text-neon-color), 0 0 calc(var(--text-neon-size) * 1.5) var(--text-neon-color), 0 0 calc(var(--text-neon-size) * 3) var(--text-neon-color); text-shadow: var(--wbw-word-glow-shadow, 0 0 0 transparent), var(--inline-word-glow-shadow, 0 0 0 transparent), var(--text-neon-shadow, 0 0 0 transparent), var(--text-glow-shadow, 0 0 0 transparent), var(--text-drop-shadow, 0 0 0 transparent);",
+				"tailwind": false,
+				"icon": "blur_on"
+			}
+		]
+	},
+	{
+		"id": "effects",
+		"name": "Visual Effects",
+		"description": "Add visual effects and filters to enhance subtitle appearance",
+		"icon": "auto_fix_high",
+		"ui": {
+			"panel": { "id": "effects", "icon": "auto_fix_high", "label": "effects", "order": 3, "categoryOrder": 4 }
+		},
+		"styles": [
+			{
+				"id": "opacity",
+				"name": "Text Opacity",
+				"description": "Control the transparency of the text",
+				"value": 1,
+				"valueType": "number",
+				"valueMin": 0,
+				"valueMax": 1,
+				"step": 0.05,
+				"css": "",
+				"tailwind": false,
+				"icon": "opacity"
+			},
+			{
+				"id": "blur",
+				"name": "Blur Effect",
+				"description": "Apply blur effect to the text",
+				"value": 0,
+				"valueType": "number",
+				"valueMin": 0,
+				"valueMax": 20,
+				"css": "--blur: {value}px; filter: blur(var(--blur, 0px)) brightness(var(--brightness, 100%)) contrast(var(--contrast, 100%));",
+				"tailwind": false,
+				"icon": "blur_on"
+			},
+			{
+				"id": "brightness",
+				"name": "Brightness",
+				"description": "Adjust the brightness of the text",
+				"value": 100,
+				"valueType": "number",
+				"valueMin": 0,
+				"valueMax": 200,
+				"css": "--brightness: {value}%;",
+				"tailwind": false,
+				"icon": "brightness_6"
+			},
+			{
+				"id": "contrast",
+				"name": "Contrast",
+				"description": "Adjust the contrast of the text",
+				"value": 100,
+				"valueType": "number",
+				"valueMin": 0,
+				"valueMax": 200,
+				"css": "--contrast: {value}%;",
+				"tailwind": false,
+				"icon": "contrast"
+			}
+		]
+	},
+	{
+		"id": "animation",
+		"name": "Animation & Transitions",
+		"description": "Add motion and transition effects to subtitles",
+		"icon": "animation",
+		"ui": {
+			"panel": { "id": "effects", "icon": "auto_fix_high", "label": "effects", "order": 3, "categoryOrder": 5 }
+		},
+		"styles": [
+			{
+				"id": "scale",
+				"name": "Scale",
+				"description": "Scale the size of the subtitle",
+				"value": 100,
+				"valueType": "number",
+				"valueMin": 25,
+				"valueMax": 300,
+				"css": "--scale: {value}%;",
+				"tailwind": false,
+				"icon": "zoom_in"
+			},
+			{
+				"id": "rotation",
+				"name": "Rotation",
+				"description": "Rotate the subtitle in degrees",
+				"value": 0,
+				"valueType": "number",
+				"valueMin": -180,
+				"valueMax": 180,
+				"css": "--rotation: {value}deg;",
+				"tailwind": false,
+				"icon": "rotate_right"
+			}
+		]
+	},
+	{
+		"id": "custom-css",
+		"name": "Custom CSS",
+		"description": "Add your own custom CSS to fully customize subtitle appearance",
+		"icon": "code",
+		"ui": {
+			"panel": { "id": "advanced", "icon": "code", "label": "custom-css", "order": 5, "categoryOrder": 0 }
+		},
+		"styles": [
+			{
+				"id": "custom-css",
+				"name": "Custom CSS",
+				"description": "Write any custom CSS for subtitles. Use !important if needed.",
+				"value": "",
+				"valueType": "text",
+				"css": "{value}",
+				"tailwind": false,
+				"icon": "code"
+			}
+		]
+	}
+]

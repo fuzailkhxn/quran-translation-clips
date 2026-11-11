@@ -1,0 +1,89 @@
+<!-- Représente une section fermable en cliquant sur le bout de flèche -->
+<script lang="ts">
+	import { globalState } from '$lib/runes/main.svelte';
+	import { onMount, untrack, type Snippet } from 'svelte';
+	import { slide } from 'svelte/transition';
+
+	let {
+		name,
+		icon,
+		classes,
+		contentClasses,
+		headerActions,
+		children,
+		dataCategory,
+		saveState = true,
+		defaultExtended = true
+	}: {
+		name: string;
+		icon: string;
+		classes?: string;
+		contentClasses?: string;
+		headerActions?: Snippet;
+		children: Snippet;
+		dataCategory?: string;
+		saveState?: boolean;
+		defaultExtended?: boolean;
+	} = $props();
+
+	let extended = $state(untrack(() => defaultExtended));
+
+	onMount(() => {
+		if (!saveState) return;
+
+		// Init la section dans l'éditeur
+		if (!globalState.getSectionsState[name]) {
+			globalState.getSectionsState[name] = {
+				extended: extended
+			};
+		} else {
+			// Si la section existe déjà, on récupère son état
+			extended = globalState.getSectionsState[name].extended;
+		}
+	});
+
+	$effect(() => {
+		if (!saveState) return;
+
+		globalState.getSectionsState[name] = {
+			extended: extended
+		};
+	});
+</script>
+
+<div class="flex flex-col gap-2" data-category={dataCategory}>
+	<div class={'flex ' + classes} onclick={() => (extended = !extended)}>
+		<h3 class="text-sm font-semibold text-primary flex items-center truncate">
+			{#if icon && (icon.includes('png') || icon.includes('svg'))}
+				<img src={icon} alt={name} class="w-6 h-6 me-2" /><span class="truncate">{name}</span>
+			{:else if !icon}
+				<span class="w-6 h-6 me-2 rounded-sm bg-black border border-color shrink-0"></span><span
+					class="truncate">{name}</span
+				>
+			{:else}
+				<span class="material-icons me-2 text-lg text-accent-primary">{icon}</span><span
+					class="truncate">{name}</span
+				>
+			{/if}
+		</h3>
+		{#if headerActions}
+			<div class="ms-auto flex items-center">
+				{@render headerActions()}
+			</div>
+		{/if}
+		<!-- dropdownicon -->
+		<button
+			class={'flex items-center cursor-pointer transition-all duration-100 ' +
+				(headerActions ? '' : 'ms-auto ') +
+				(extended ? 'rotate-180' : '')}
+		>
+			<span class="material-icons text-4xl! text-accent-primary">arrow_drop_down</span>
+		</button>
+	</div>
+
+	{#if extended}
+		<div transition:slide class={contentClasses}>
+			{@render children()}
+		</div>
+	{/if}
+</div>

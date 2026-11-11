@@ -1,0 +1,2021 @@
+import { cleanup, render } from 'vitest-browser-svelte';
+import { afterEach, describe, expect, test, vi } from 'vitest';
+import { tick } from 'svelte';
+import { page } from '@vitest/browser/context';
+
+import VideoOverlay from '$lib/components/projectEditor/videoPreview/VideoOverlay.svelte';
+import { globalState } from '$lib/runes/main.svelte';
+import { ProjectEditorState } from '$lib/classes/ProjectEditorState.svelte';
+import { Timeline } from '$lib/classes/Timeline.svelte';
+import { ProjectEditorTabs, TrackType } from '$lib/classes/enums';
+import { PredefinedSubtitleClip, SubtitleClip } from '$lib/classes/Clip.svelte';
+import { Translation, VerseTranslation } from '$lib/classes/Translation.svelte';
+import { AssetTrack, CustomTextTrack, SubtitleTrack } from '$lib/classes/Track.svelte';
+import { getRenderedLineCount } from '$lib/components/projectEditor/videoPreview/helpers/reactiveFontSize';
+import QPCFontProvider from '$lib/services/FontProvider';
+import MinimalQuranProvider from '$lib/services/MinimalQuranProvider';
+import RiwayahProvider from '$lib/services/RiwayahProvider';
+import { ProjectHistoryManager } from '$lib/services/undoRedo/ProjectHistoryManager';
+
+vi.mock('$lib/components/projectEditor/tabs/styleEditor/ReciterName.svelte', async () => ({
+	default: (await import('../../../../stubs/EmptyComponent.svelte')).default
+}));
+
+vi.mock('$lib/components/projectEditor/tabs/styleEditor/SurahName.svelte', async () => ({
+	default: (await import('../../../../stubs/EmptyComponent.svelte')).default
+}));
+
+vi.mock('$lib/components/projectEditor/tabs/styleEditor/VerseNumber.svelte', async () => ({
+	default: (await import('../../../../stubs/EmptyComponent.svelte')).default
+}));
+
+vi.mock('$lib/components/projectEditor/tabs/styleEditor/CustomText.svelte', async () => ({
+	default: (await import('../../../../stubs/EmptyComponent.svelte')).default
+}));
+
+vi.mock('$lib/components/projectEditor/tabs/styleEditor/CustomImage.svelte', async () => ({
+	default: (await import('../../../../stubs/EmptyComponent.svelte')).default
+}));
+
+vi.mock('$lib/services/verticalDrag', () => ({
+	mouseDrag: () => ({
+		destroy() {}
+	})
+}));
+
+vi.mock('@tauri-apps/api/core', async () => {
+	const actual =
+		await vi.importActual<typeof import('@tauri-apps/api/core')>('@tauri-apps/api/core');
+
+	return {
+		...actual,
+		convertFileSrc: (path: string) => path
+	};
+});
+
+type MockStyle = {
+	id: string;
+	valueType: 'number';
+	value: string | number | boolean | null;
+};
+
+type MockStyleTarget = {
+	categories: unknown[];
+	overrides: Record<number, Record<string, string | number | boolean | null>>;
+	findStyle: (styleId: string) => MockStyle;
+	generateCSS: (clipId?: number) => string;
+	generateTailwind: () => string;
+	getEffectiveValue: (styleId: string, clipId?: number) => string | number | boolean | null;
+	getKeyframeTimes: () => number[];
+	setStyle: (styleId: string, value: string | number | boolean | null) => void;
+	setStyleForClips: (
+		clipIds: number[],
+		styleId: string,
+		value: string | number | boolean | null
+	) => void;
+};
+
+type MockVideoStyle = {
+	doesTargetStyleExist: (target: string) => boolean;
+	getStylesOfTarget: (target: string) => MockStyleTarget;
+	highlightCategory: () => void;
+};
+
+type VideoOverlayFixture = {
+	setCursor: (cursorPosition: number) => Promise<void>;
+	setPlaying: (isPlaying: boolean) => Promise<void>;
+	subtitleTrack: SubtitleTrack;
+	videoStyle: MockVideoStyle;
+};
+
+function createDefaultStyleValue(
+	target: string,
+	styleId: string
+): string | number | boolean | null {
+	if (styleId === 'opacity') return 1;
+	if (styleId === 'show-subtitles') return true;
+	if (styleId === 'max-height') return 0;
+	if (styleId === 'width') return 80;
+	if (styleId === 'max-line') return 'Infinite';
+	if (styleId === 'font-size') return target === 'arabic' ? 42 : 28;
+	if (styleId === 'vertical-text-alignment') return 'center';
+	if (styleId === 'reactive-font-size') return target === 'arabic' ? 42 : 28;
+	if (styleId === 'reactive-y-position') return 0;
+	if (styleId === 'show-verse-number') return false;
+	if (styleId === 'verse-number-position') return 'after';
+	if (styleId === 'verse-number-format') return '(<number>)';
+	if (styleId === 'font-family') return 'MockArabic';
+	if (styleId === 'riwayah') return 'Hafs';
+	if (styleId === 'mushaf-style') return 'Uthmani';
+	if (styleId === 'basmala-style') return 'current-font';
+	if (styleId === 'show-decorative-brackets') return false;
+	if (styleId === 'decorative-brackets-font-family') return 'LM';
+	if (styleId === 'fade-duration') return 200;
+	if (styleId === 'spacing') return 0;
+	if (styleId === 'anti-collision') return false;
+	if (styleId === 'overlay-enable') return false;
+	if (styleId === 'overlay-blur') return 0;
+	if (styleId === 'overlay-opacity') return 0;
+	if (styleId === 'overlay-color') return '#000000';
+	if (styleId === 'background-overlay-mode') return 'uniform';
+	if (styleId === 'background-overlay-fade-intensity') return 0;
+	if (styleId === 'background-overlay-fade-coverage') return 0;
+	if (styleId === 'background-overlay-fade-softness') return 1;
+	if (styleId === 'background-overlay-fade-curve') return 'linear';
+	if (styleId === 'background-overlay-fade-invert') return false;
+	if (styleId === 'background-overlay-fade-position-x') return 0.5;
+	if (styleId === 'background-overlay-fade-position-y') return 0.5;
+	if (styleId === 'background-overlay-fade-width') return 1;
+	if (styleId === 'background-overlay-fade-height') return 1;
+	if (styleId === 'overlay-custom-css') return '';
+	if (styleId === 'enable-wbw-highlight') return false;
+	if (styleId === 'enable-wbw-background') return false;
+	if (styleId === 'enable-wbw-underline') return false;
+	if (styleId === 'background-enable') return false;
+	if (styleId === 'background-horizontal-padding') return 0;
+	return 0;
+}
+
+function createMockVideoStyle(targets: string[]): MockVideoStyle {
+	const targetsMap = new Map<string, MockStyleTarget>();
+
+	function ensureTarget(target: string): MockStyleTarget {
+		const existing = targetsMap.get(target);
+		if (existing) return existing;
+
+		const styles = new Map<string, MockStyle>();
+
+		const styleTarget: MockStyleTarget = {
+			categories: [],
+			overrides: {},
+			findStyle(styleId: string) {
+				if (!styles.has(styleId)) {
+					styles.set(styleId, {
+						id: styleId,
+						valueType: 'number',
+						value: createDefaultStyleValue(target, styleId)
+					});
+				}
+				return styles.get(styleId)!;
+			},
+			generateCSS(clipId?: number) {
+				return `--mock-target: ${target}; --mock-clip-id: ${clipId ?? -1};`;
+			},
+			generateTailwind() {
+				return '';
+			},
+			getEffectiveValue(styleId: string, clipId?: number) {
+				if (clipId !== undefined && this.overrides[clipId]?.[styleId] !== undefined) {
+					return this.overrides[clipId][styleId];
+				}
+				return this.findStyle(styleId).value;
+			},
+			getKeyframeTimes() {
+				return [];
+			},
+			setStyle(styleId: string, value: string | number | boolean | null) {
+				this.findStyle(styleId).value = value;
+			},
+			setStyleForClips(
+				clipIds: number[],
+				styleId: string,
+				value: string | number | boolean | null
+			) {
+				for (const clipId of clipIds) {
+					this.overrides[clipId] ??= {};
+					this.overrides[clipId][styleId] = value;
+				}
+			}
+		};
+
+		targetsMap.set(target, styleTarget);
+		return styleTarget;
+	}
+
+	for (const target of targets) {
+		ensureTarget(target);
+	}
+
+	return {
+		doesTargetStyleExist(target: string) {
+			return targetsMap.has(target);
+		},
+		getStylesOfTarget(target: string) {
+			return ensureTarget(target);
+		},
+		highlightCategory() {}
+	};
+}
+
+function createVerseSubtitle(
+	startTime: number,
+	endTime: number,
+	arabicText: string,
+	translationText: string,
+	surah: number = 1,
+	verse: number = 1
+): SubtitleClip {
+	return new SubtitleClip(startTime, endTime, surah, verse, 0, 1, arabicText, [], false, false, {
+		english: new VerseTranslation(translationText, 'reviewed')
+	});
+}
+
+function applyVisualMerge(
+	clips: SubtitleClip[],
+	mode: 'arabic' | 'translation' | 'both',
+	groupId: string = `group-${mode}`
+): void {
+	for (const clip of clips) {
+		clip.setVisualMerge(groupId, mode);
+	}
+}
+
+function createPredefinedSubtitle(
+	startTime: number,
+	endTime: number,
+	type: ConstructorParameters<typeof PredefinedSubtitleClip>[2],
+	translationText: string
+): PredefinedSubtitleClip {
+	const clip = new PredefinedSubtitleClip(startTime, endTime, type);
+	clip.translations = {
+		english: new Translation(translationText, 'completed by default')
+	};
+	return clip;
+}
+
+/**
+ * Crée un clip Quran dont le dernier mot déclenche le suffixe du numéro de verset.
+ * @param {number} startTime Début du clip en millisecondes.
+ * @param {number} endTime Fin du clip en millisecondes.
+ * @param {number} surah Numéro de sourate.
+ * @param {number} verse Numéro de verset.
+ * @param {number} startWordIndex Index du premier mot inclus.
+ * @param {number} endWordIndex Index du dernier mot inclus.
+ * @returns {SubtitleClip} Clip prêt pour les tests de rendu QPC.
+ */
+function createLastWordsQpcSubtitle(
+	startTime: number,
+	endTime: number,
+	surah: number,
+	verse: number,
+	startWordIndex: number,
+	endWordIndex: number
+): SubtitleClip {
+	return new SubtitleClip(
+		startTime,
+		endTime,
+		surah,
+		verse,
+		startWordIndex,
+		endWordIndex,
+		`${surah}:${verse}`,
+		[],
+		false,
+		true,
+		{
+			english: new VerseTranslation(`${surah}:${verse}`, 'reviewed')
+		}
+	);
+}
+
+/**
+ * Injecte uniquement les glyphes QPC2 nécessaires aux scénarios de test.
+ * @returns {void}
+ */
+function seedQpc2PreviewFixture(): void {
+	QPCFontProvider.qpc2Glyphs = {
+		'1:1:1': 'ﱁ',
+		'1:1:2': 'ﱂ',
+		'1:1:3': 'ﱃ',
+		'1:1:4': 'ﱄ',
+		'1:1:5': 'ﱅ',
+		'1:2:1': 'ﱆ',
+		'1:2:2': 'ﱇ',
+		'1:2:3': 'ﱈ',
+		'1:2:4': 'ﱉ',
+		'1:2:5': 'ﱊ',
+		'71:10:4': 'ﳆ',
+		'71:10:5': 'ﳇ',
+		'71:10:6': 'ﳈ',
+		'71:10:7': 'ﳉ',
+		'71:11:1': 'ﱁ',
+		'71:11:2': 'ﱂ',
+		'71:11:3': 'ﱃ',
+		'71:11:4': 'ﱄ',
+		'71:11:5': 'ﱅ'
+	};
+	QPCFontProvider.verseMappingV2 = {
+		'1:1': 'QPC2_p001',
+		'1:2': 'QPC2_p001',
+		'71:10': 'QPC2_p570',
+		'71:11': 'QPC2_p571'
+	};
+}
+
+function setupVideoOverlayFixture(
+	clips: Array<SubtitleClip | PredefinedSubtitleClip>,
+	options: {
+		cursorPosition?: number;
+		isPlaying?: boolean;
+		addedTranslationEditionNames?: string[];
+	} = {}
+): VideoOverlayFixture {
+	const { cursorPosition = 0, isPlaying = false, addedTranslationEditionNames } = options;
+
+	const projectEditorState = new ProjectEditorState();
+	projectEditorState.currentTab = ProjectEditorTabs.VideoEditor;
+	projectEditorState.timeline.cursorPosition = cursorPosition;
+	projectEditorState.timeline.movePreviewTo = cursorPosition;
+	projectEditorState.videoPreview.isPlaying = isPlaying;
+
+	const subtitleTrack = new SubtitleTrack();
+	subtitleTrack.clips = clips;
+
+	const videoTrack = new AssetTrack(TrackType.Video);
+	const audioTrack = new AssetTrack(TrackType.Audio);
+	const customTrack = new CustomTextTrack();
+
+	const translationTargets = Array.from(
+		new Set(
+			clips.flatMap((clip) =>
+				clip instanceof SubtitleClip || clip instanceof PredefinedSubtitleClip
+					? Object.keys(clip.translations)
+					: []
+			)
+		)
+	);
+	const videoStyle = createMockVideoStyle(['global', 'arabic', ...translationTargets]);
+	const projectTranslationTargets = addedTranslationEditionNames ?? translationTargets;
+
+	globalState.currentProject = {
+		toJSON: () => ({}),
+		projectEditorState,
+		content: {
+			timeline: new Timeline([subtitleTrack, videoTrack, audioTrack, customTrack]),
+			projectTranslation: {
+				addedTranslationEditions: projectTranslationTargets.map((name) => ({
+					name,
+					language: name,
+					author: name
+				})),
+				getPredefinedSubtitleTranslation: vi.fn(),
+				getTranslations: vi.fn().mockResolvedValue({})
+			},
+			videoStyle
+		},
+		detail: {
+			reciter: '',
+			updatePercentageTranslated: vi.fn()
+		}
+	} as never;
+
+	return {
+		async setCursor(nextCursorPosition: number) {
+			projectEditorState.timeline.cursorPosition = nextCursorPosition;
+			projectEditorState.timeline.movePreviewTo = nextCursorPosition;
+			await tick();
+		},
+		async setPlaying(nextIsPlaying: boolean) {
+			projectEditorState.videoPreview.isPlaying = nextIsPlaying;
+			await tick();
+		},
+		subtitleTrack,
+		videoStyle
+	};
+}
+
+function normalizeText(text: string | null | undefined): string {
+	return text?.replace(/\s+/g, ' ').trim() ?? '';
+}
+
+async function settleOverlay(): Promise<void> {
+	await tick();
+	await new Promise((resolve) => setTimeout(resolve, 25));
+	await tick();
+}
+
+function getSubtitlesContainer(container: HTMLElement): HTMLElement | null {
+	return container.querySelector('#subtitles-container');
+}
+
+function getCurrentSubtitleText(container: HTMLElement): string {
+	const subtitleContainer = getSubtitlesContainer(container);
+	return normalizeText(subtitleContainer?.textContent);
+}
+
+function getBackgroundArabicNode(container: HTMLElement): HTMLElement | null {
+	return container.querySelector('#subtitles-backgrounds .arabic.subtitle');
+}
+
+function getForegroundArabicNode(container: HTMLElement): HTMLElement | null {
+	return container.querySelector('#subtitles-container .arabic.subtitle');
+}
+
+function getForegroundTranslationNode(container: HTMLElement, edition: string): HTMLElement | null {
+	return container.querySelector(`#subtitles-container .translation.subtitle.${edition}`);
+}
+
+/**
+ * Retourne les spans stylés du flux arabe principal.
+ * @param {HTMLElement} container Conteneur rendu par le test.
+ * @returns {HTMLElement[]} Spans directs du flux inline arabe.
+ */
+function getArabicInlineFlowSpans(container: HTMLElement): HTMLElement[] {
+	return Array.from(
+		container.querySelectorAll(
+			'#subtitles-container .arabic.subtitle .translation-inline-flow > span'
+		)
+	);
+}
+
+/**
+ * Retourne uniquement les spans du numéro de verset arabe.
+ * @param {HTMLElement} container Conteneur rendu par le test.
+ * @returns {HTMLElement[]} Spans colorés comme numéro de verset.
+ */
+function getArabicVerseNumberSpans(container: HTMLElement): HTMLElement[] {
+	return getArabicInlineFlowSpans(container).filter((span) =>
+		span.getAttribute('style')?.includes('verse-number-color')
+	);
+}
+
+/**
+ * Lit les pixels réellement rendus afin de détecter les raccords du fond par ligne.
+ * @param {HTMLElement} element Élément à capturer dans le navigateur.
+ * @returns {Promise<ImageData>} Pixels de la capture, sans fichier de référence.
+ */
+async function capturePixels(element: HTMLElement): Promise<ImageData> {
+	const screenshot = await page.screenshot({ element, save: false });
+	const image = new Image();
+	image.src = `data:image/png;base64,${screenshot}`;
+	await image.decode();
+	const canvas = document.createElement('canvas');
+	canvas.width = image.naturalWidth;
+	canvas.height = image.naturalHeight;
+	const context = canvas.getContext('2d')!;
+	context.drawImage(image, 0, 0);
+	return context.getImageData(0, 0, canvas.width, canvas.height);
+}
+
+describe('Video overlay subtitle preview', () => {
+	afterEach(() => {
+		cleanup();
+		vi.restoreAllMocks();
+		globalState.currentProject = null;
+		globalState.settings = undefined;
+		QPCFontProvider.qpc2Glyphs = undefined;
+		QPCFontProvider.verseMappingV2 = undefined;
+	});
+
+	test('finishes export layout only after fonts and fitting, even when timers are suspended', async () => {
+		const originalUrl = window.location.href;
+		let releaseFonts!: () => void;
+		const fontsReady = new Promise<void>((resolve) => {
+			releaseFonts = resolve;
+		});
+		vi.spyOn(QPCFontProvider, 'waitForFontsInElement').mockReturnValue(fontsReady);
+		vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+		window.history.replaceState(null, '', '/exporter?id=layout-test');
+		try {
+			const fixture = setupVideoOverlayFixture(
+				[createVerseSubtitle(0, 999, 'Arabic '.repeat(30), 'Translation '.repeat(30))],
+				{ cursorPosition: 100 }
+			);
+			fixture.videoStyle.getStylesOfTarget('arabic').setStyle('max-line', 1);
+			const component = render(VideoOverlay);
+			await tick();
+			const container = getSubtitlesContainer(component.container)!;
+			expect(container.dataset.exportLayoutState).toBe('pending');
+			await fixture.setCursor(150);
+			expect(container.dataset.exportLayoutState).toBe('pending');
+			releaseFonts();
+			// Flush Svelte updates without running any background-window timer callbacks.
+			for (let update = 0; update < 100; update++) await tick();
+			expect(container.dataset.exportLayoutState).toBe('ready');
+			expect(container.dataset.exportLayoutTiming).toBe('150');
+			expect(container.style.opacity).toBe('1');
+		} finally {
+			releaseFonts();
+			vi.useRealTimers();
+			window.history.replaceState(null, '', originalUrl);
+		}
+	});
+
+	test('reorders subtitle layers from the preview context menu without trapping them in a parent layer', async () => {
+		setupVideoOverlayFixture([createVerseSubtitle(0, 999, 'Arabic', 'Translation')], {
+			cursorPosition: 500
+		});
+		vi.spyOn(ProjectHistoryManager, 'track').mockImplementation((_label, action) => action());
+		const component = render(VideoOverlay);
+		await settleOverlay();
+		const arabic = getForegroundArabicNode(component.container)!;
+		const translation = getForegroundTranslationNode(component.container, 'english')!;
+		expect(Number(getComputedStyle(arabic).zIndex)).toBeLessThan(
+			Number(getComputedStyle(translation).zIndex)
+		);
+		expect(getComputedStyle(getSubtitlesContainer(component.container)!).zIndex).toBe('auto');
+		arabic.dispatchEvent(
+			new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 100, clientY: 100 })
+		);
+		await tick();
+		const moveUpIcon = Array.from(
+			document.querySelectorAll('button .material-icons-outlined')
+		).find(
+			(element) => element.textContent === 'flip_to_front' && element.getClientRects().length > 0
+		);
+		expect(moveUpIcon).toBeDefined();
+		moveUpIcon!.closest<HTMLButtonElement>('button')!.click();
+		await tick();
+		expect(Number(getComputedStyle(arabic).zIndex)).toBeGreaterThan(
+			Number(getComputedStyle(translation).zIndex)
+		);
+		expect(getComputedStyle(getSubtitlesContainer(component.container)!).zIndex).toBe('auto');
+		expect(ProjectHistoryManager.track).toHaveBeenCalledWith(
+			'move overlay layer',
+			expect.any(Function)
+		);
+	});
+
+	test.each([0, 50, 100, undefined])(
+		'renders square or rounded line backgrounds without dark seams at %s percent',
+		async (roundness) => {
+			setupVideoOverlayFixture([createVerseSubtitle(0, 999, 'Arabic', 'Translation')], {
+				cursorPosition: 500
+			});
+			const component = render(VideoOverlay);
+			await settleOverlay();
+			const host = document.createElement('div');
+			host.style.cssText =
+				'position: fixed; top: 10px; left: 10px; width: 330px; padding: 20px; background: black; color: transparent; font: 24px/120px monospace; white-space: pre; transform: scale(0.83); transform-origin: top left; z-index: 9999; --line-background-height: 73px; --line-background-position: 0px; --line-background-color: #c08020;';
+			if (roundness !== undefined)
+				host.style.setProperty('--line-background-roundness', String(roundness));
+			const bar = document.createElement('span');
+			bar.className = 'line-background';
+			bar.textContent = 'AAAAAAAAAAAA\nAAAAAA';
+			host.append(bar);
+			getSubtitlesContainer(component.container)!.append(host);
+			const bounds = host.getBoundingClientRect();
+			const fragments = Array.from(bar.getClientRects());
+			expect(fragments).toHaveLength(2);
+			const pixels = await capturePixels(host);
+			const scaleX = pixels.width / bounds.width;
+			const scaleY = pixels.height / bounds.height;
+			for (const fragment of fragments) {
+				const left = Math.round((fragment.left - bounds.left) * scaleX);
+				const right = Math.round((fragment.right - bounds.left) * scaleX);
+				const centerY = Math.round(((fragment.top + fragment.bottom) / 2 - bounds.top) * scaleY);
+				for (const y of [centerY - 1, centerY, centerY + 1]) {
+					for (let x = left + 2; x < right - 2; x++) {
+						const index = (y * pixels.width + x) * 4;
+						for (const [channel, expected] of [192, 128, 32].entries()) {
+							expect(
+								Math.abs(pixels.data[index + channel] - expected),
+								`Seam at ${x}, ${y}`
+							).toBeLessThanOrEqual(4);
+						}
+					}
+				}
+				const cornerY = Math.round(centerY - (73 * 0.83 * scaleY) / 2 + 3);
+				const cornerIndex = (cornerY * pixels.width + left + 2) * 4;
+				if (roundness === 0) expect(pixels.data[cornerIndex]).toBeGreaterThan(180);
+				else expect(pixels.data[cornerIndex]).toBeLessThan(10);
+			}
+		}
+	);
+
+	test('keeps the subtitle container visible when playback advances within the new subtitle', async () => {
+		const fixture = setupVideoOverlayFixture(
+			[
+				createVerseSubtitle(0, 999, 'Alpha Arabic', 'Alpha translation'),
+				createVerseSubtitle(1000, 1999, 'Beta Arabic', 'Beta translation')
+			],
+			{ cursorPosition: 100 }
+		);
+
+		const component = render(VideoOverlay);
+		await settleOverlay();
+
+		await fixture.setPlaying(true);
+		await fixture.setCursor(1100);
+		await fixture.setCursor(1150);
+		await settleOverlay();
+
+		const subtitleContainer = getSubtitlesContainer(component.container);
+		expect(subtitleContainer).not.toBeNull();
+		expect(subtitleContainer!.style.opacity).toBe('1');
+		expect(getCurrentSubtitleText(component.container)).toContain('Beta Arabic');
+		expect(getCurrentSubtitleText(component.container)).toContain('Beta translation');
+	});
+
+	test('shows the next subtitle again after crossing a gap during playback', async () => {
+		const fixture = setupVideoOverlayFixture(
+			[
+				createVerseSubtitle(0, 400, 'Gap Alpha', 'Gap alpha translation'),
+				createVerseSubtitle(1000, 1499, 'Gap Beta', 'Gap beta translation')
+			],
+			{ cursorPosition: 100 }
+		);
+
+		const component = render(VideoOverlay);
+		await settleOverlay();
+
+		await fixture.setPlaying(true);
+		await fixture.setCursor(700);
+		await tick();
+		expect(getSubtitlesContainer(component.container)).toBeNull();
+
+		await fixture.setCursor(1100);
+		await fixture.setCursor(1120);
+		await settleOverlay();
+
+		const subtitleContainer = getSubtitlesContainer(component.container);
+		expect(subtitleContainer).not.toBeNull();
+		expect(subtitleContainer!.style.opacity).toBe('1');
+		expect(getCurrentSubtitleText(component.container)).toContain('Gap Beta');
+		expect(getCurrentSubtitleText(component.container)).toContain('Gap beta translation');
+	});
+
+	test('keeps predefined subtitle previews visible during playback switches', async () => {
+		const fixture = setupVideoOverlayFixture(
+			[
+				createVerseSubtitle(0, 999, 'Regular Subtitle', 'Regular translation'),
+				createPredefinedSubtitle(1000, 1999, 'Basmala', 'Predefined translation')
+			],
+			{ cursorPosition: 100 }
+		);
+
+		const component = render(VideoOverlay);
+		await settleOverlay();
+
+		await fixture.setPlaying(true);
+		await fixture.setCursor(1100);
+		await fixture.setCursor(1180);
+		await settleOverlay();
+
+		const subtitleContainer = getSubtitlesContainer(component.container);
+		expect(subtitleContainer).not.toBeNull();
+		expect(subtitleContainer!.style.opacity).toBe('1');
+		expect(getCurrentSubtitleText(component.container)).toContain('Predefined translation');
+	});
+
+	test('renders predefined basmala preview with its special arabic glyph text', async () => {
+		const basmala = createPredefinedSubtitle(1000, 1999, 'Basmala', 'Predefined translation');
+		const fixture = setupVideoOverlayFixture([basmala], { cursorPosition: 1100 });
+		fixture.videoStyle.getStylesOfTarget('arabic').setStyle('font-family', 'QPC2');
+
+		const component = render(VideoOverlay);
+		await settleOverlay();
+
+		const arabicNode = getForegroundArabicNode(component.container);
+		expect(arabicNode).not.toBeNull();
+		expect(normalizeText(arabicNode?.textContent)).toBe(normalizeText(basmala.getText()));
+	});
+
+	test('ignores stale predefined translations that are no longer added to the project', async () => {
+		const basmala = createPredefinedSubtitle(0, 999, 'Basmala', 'Added translation');
+		basmala.translations.stale = new Translation('Stale translation', 'completed by default');
+		setupVideoOverlayFixture([basmala], {
+			cursorPosition: 500,
+			addedTranslationEditionNames: ['english']
+		});
+
+		const component = render(VideoOverlay);
+		await settleOverlay();
+
+		const subtitleText = getCurrentSubtitleText(component.container);
+		expect(subtitleText).toContain('Added translation');
+		expect(subtitleText).not.toContain('Stale translation');
+	});
+
+	test('renders Uthmani text with an individual non-QPC font override', async () => {
+		seedQpc2PreviewFixture();
+		const clip = createVerseSubtitle(0, 999, 'بِسْمِ اللَّهِ', 'Translation');
+		const fixture = setupVideoOverlayFixture([clip], { cursorPosition: 500 });
+		const arabicStyles = fixture.videoStyle.getStylesOfTarget('arabic');
+		arabicStyles.setStyle('font-family', 'QPC2');
+		arabicStyles.overrides[clip.id] = { 'font-family': 'Hafs' };
+
+		const component = render(VideoOverlay);
+		await settleOverlay();
+
+		const arabicNode = getForegroundArabicNode(component.container);
+		expect(normalizeText(arabicNode?.textContent)).toBe('بِسْمِ اللَّهِ');
+		expect(
+			getArabicInlineFlowSpans(component.container)[0]?.getAttribute('style') ?? ''
+		).not.toContain('QPC2');
+	});
+
+	test('renders QPC glyphs with an individual QPC font override', async () => {
+		seedQpc2PreviewFixture();
+		const clip = createVerseSubtitle(0, 999, 'بِسْمِ اللَّهِ', 'Translation');
+		const fixture = setupVideoOverlayFixture([clip], { cursorPosition: 500 });
+		fixture.videoStyle.getStylesOfTarget('arabic').overrides[clip.id] = {
+			'font-family': 'QPC2'
+		};
+
+		const component = render(VideoOverlay);
+		await settleOverlay();
+
+		expect(normalizeText(getForegroundArabicNode(component.container)?.textContent)).toBe('ﱁ ﱂ');
+		expect(getArabicInlineFlowSpans(component.container)[0]?.getAttribute('style')).toContain(
+			'font-family: QPC2_p001'
+		);
+	});
+
+	test('renders predefined Uthmani text with an individual non-QPC font override', async () => {
+		const basmala = createPredefinedSubtitle(0, 999, 'Basmala', 'Translation');
+		const fixture = setupVideoOverlayFixture([basmala], { cursorPosition: 500 });
+		const arabicStyles = fixture.videoStyle.getStylesOfTarget('arabic');
+		arabicStyles.setStyle('font-family', 'QPC2');
+		arabicStyles.overrides[basmala.id] = { 'font-family': 'Hafs' };
+
+		const component = render(VideoOverlay);
+		await settleOverlay();
+
+		expect(normalizeText(getForegroundArabicNode(component.container)?.textContent)).toBe(
+			normalizeText(basmala.text)
+		);
+	});
+
+	test('keeps merged arabic visible while translations continue to switch per clip', async () => {
+		const firstClip = createVerseSubtitle(0, 999, 'Alpha Arabic', 'Alpha translation');
+		const secondClip = createVerseSubtitle(1000, 1999, 'Beta Arabic', 'Beta translation');
+		firstClip.startWordIndex = 0;
+		firstClip.endWordIndex = 1;
+		secondClip.startWordIndex = 2;
+		secondClip.endWordIndex = 3;
+		applyVisualMerge([firstClip, secondClip], 'arabic');
+		setupVideoOverlayFixture([firstClip, secondClip], { cursorPosition: 1100 });
+
+		const component = render(VideoOverlay);
+		await settleOverlay();
+
+		const mergedText = getCurrentSubtitleText(component.container);
+		expect(mergedText).toContain('Alpha Arabic');
+		expect(mergedText).toContain('Beta Arabic');
+		expect(mergedText).toContain('Beta translation');
+		expect(mergedText).not.toContain('Alpha translation');
+	});
+
+	test('uses one mapped Warsh number for translations merged from two Hafs ayahs', async () => {
+		const firstClip = createVerseSubtitle(0, 999, 'الم', 'Alif, Lam, Mim. ', 2, 1);
+		const secondClip = createVerseSubtitle(
+			1000,
+			1999,
+			'ذلك الكتاب لا ريب فيه هدى للمتقين',
+			'Voici le Livre qui ne fait aucun doute.',
+			2,
+			2
+		);
+		vi.spyOn(RiwayahProvider, 'getVerseSlice').mockReturnValue(null);
+		vi.spyOn(RiwayahProvider, 'getTranslationVerseNumber').mockImplementation(
+			(_riwayah, _surah, verse, position) => (position === 'before' && verse === 1 ? '1' : null)
+		);
+		applyVisualMerge([firstClip, secondClip], 'both');
+		const fixture = setupVideoOverlayFixture([firstClip, secondClip], { cursorPosition: 1500 });
+		fixture.videoStyle.getStylesOfTarget('arabic').setStyle('riwayah', 'Warsh');
+		const translationStyles = fixture.videoStyle.getStylesOfTarget('english');
+		translationStyles.setStyle('show-verse-number', true);
+		translationStyles.setStyle('verse-number-position', 'before');
+		translationStyles.setStyle('verse-number-format', '<number>. ');
+
+		const component = render(VideoOverlay);
+		await settleOverlay();
+
+		expect(
+			normalizeText(getForegroundTranslationNode(component.container, 'english')?.textContent)
+		).toBe('1. Alif, Lam, Mim. Voici le Livre qui ne fait aucun doute.');
+	});
+
+	test('renders the full Warsh verse range for one split Hafs ayah translation', async () => {
+		const clip = createVerseSubtitle(0, 999, 'آية الكرسي', 'Le verset du Trône.', 2, 255);
+		vi.spyOn(RiwayahProvider, 'getVerseSlice').mockReturnValue(null);
+		vi.spyOn(RiwayahProvider, 'getTranslationVerseNumber').mockReturnValue('253-254');
+		const fixture = setupVideoOverlayFixture([clip], { cursorPosition: 500 });
+		fixture.videoStyle.getStylesOfTarget('arabic').setStyle('riwayah', 'Warsh');
+		const translationStyles = fixture.videoStyle.getStylesOfTarget('english');
+		translationStyles.setStyle('show-verse-number', true);
+		translationStyles.setStyle('verse-number-position', 'before');
+		translationStyles.setStyle('verse-number-format', '<number>. ');
+
+		const component = render(VideoOverlay);
+		await settleOverlay();
+
+		expect(
+			normalizeText(getForegroundTranslationNode(component.container, 'english')?.textContent)
+		).toBe('253-254. Le verset du Trône.');
+	});
+
+	test('keeps QPC2 verse-number fonts per clip across a merged page boundary', async () => {
+		seedQpc2PreviewFixture();
+		const firstClip = createLastWordsQpcSubtitle(0, 999, 71, 10, 3, 5);
+		const secondClip = createLastWordsQpcSubtitle(1000, 1999, 71, 11, 0, 3);
+		applyVisualMerge([firstClip, secondClip], 'arabic');
+		const fixture = setupVideoOverlayFixture([firstClip, secondClip], { cursorPosition: 1100 });
+		fixture.videoStyle.getStylesOfTarget('arabic').setStyle('font-family', 'QPC2');
+		fixture.videoStyle.getStylesOfTarget('arabic').setStyle('show-verse-number', true);
+
+		const component = render(VideoOverlay);
+		await settleOverlay();
+
+		const spans = getArabicInlineFlowSpans(component.container);
+		const verseNumberSpans = getArabicVerseNumberSpans(component.container);
+		expect(normalizeText(getForegroundArabicNode(component.container)?.textContent)).toBe(
+			'ﳆ ﳇ ﳈ ﳉ ﱁ ﱂ ﱃ ﱄ ﱅ'
+		);
+		expect(spans.map((span) => span.getAttribute('style'))).toEqual([
+			expect.stringContaining('font-family: QPC2_p570'),
+			expect.stringContaining('font-family: QPC2_p570'),
+			expect.stringContaining('font-family: QPC2_p571'),
+			expect.stringContaining('font-family: QPC2_p571')
+		]);
+		expect(verseNumberSpans.map((span) => span.textContent)).toEqual([' ﳉ', ' ﱅ']);
+		expect(verseNumberSpans.map((span) => span.getAttribute('style'))).toEqual([
+			expect.stringContaining('font-family: QPC2_p570'),
+			expect.stringContaining('font-family: QPC2_p571')
+		]);
+	});
+
+	test('renders a line break before the arabic verse number when enabled', async () => {
+		const clip = createLastWordsQpcSubtitle(0, 999, 1, 1, 0, 1);
+		const fixture = setupVideoOverlayFixture([clip], { cursorPosition: 500 });
+		fixture.videoStyle.getStylesOfTarget('arabic').setStyle('show-verse-number', true);
+		fixture.videoStyle.getStylesOfTarget('arabic').setStyle('verse-number-new-line', true);
+
+		const component = render(VideoOverlay);
+		await settleOverlay();
+
+		const verseNumber = getArabicVerseNumberSpans(component.container)[0];
+		expect(verseNumber.textContent).toBe('١');
+		expect(verseNumber.previousElementSibling?.tagName).toBe('BR');
+	});
+
+	test('fits qpc arabic text and its verse number on one line when max line is one', async () => {
+		seedQpc2PreviewFixture();
+		const clip = createLastWordsQpcSubtitle(0, 999, 1, 2, 0, 3);
+		const fixture = setupVideoOverlayFixture([clip], { cursorPosition: 500 });
+		const arabicStyles = fixture.videoStyle.getStylesOfTarget('arabic');
+		arabicStyles.setStyle('show-verse-number', true);
+		arabicStyles.setStyle('verse-number-new-line', false);
+		arabicStyles.setStyle('font-family', 'QPC2');
+		arabicStyles.setStyle('max-height', 245);
+		arabicStyles.setStyle('max-line', '1');
+		arabicStyles.setStyle('font-size', 96);
+		arabicStyles.setStyle('line-height', 1.6);
+		arabicStyles.setStyle('width', 53);
+		arabicStyles.generateCSS = () =>
+			'width: 53%; height: 245px; font-size: 96px; line-height: 1.6; color: #4a372b; display: flex; align-items: center; --line-background-height: 73px; --line-background-position: 24px; --line-background-color: #f3e2c1;';
+
+		const component = render(VideoOverlay);
+		const overlay = component.container.querySelector('#overlay') as HTMLElement;
+		overlay.style.width = '1320px';
+		overlay.style.height = '743px';
+		await settleOverlay();
+
+		const arabicNode = getForegroundArabicNode(component.container)!;
+		await vi.waitFor(() => {
+			expect(Number.parseFloat(getComputedStyle(arabicNode).fontSize)).toBeLessThan(96);
+			arabicNode.classList.add('subtitle-layout-measurement');
+			expect(arabicNode.scrollHeight).toBeLessThanOrEqual(245);
+			arabicNode.classList.remove('subtitle-layout-measurement');
+			expect(getRenderedLineCount(arabicNode)).toBe(1);
+		});
+		expect(getArabicVerseNumberSpans(component.container)[0]).toBeTruthy();
+	});
+
+	test('uses the selected subtitle max-height override when fitting its text', async () => {
+		const clip = createVerseSubtitle(0, 999, 'Arabic', 'Translation');
+		const fixture = setupVideoOverlayFixture([clip], { cursorPosition: 500 });
+		const translationStyles = fixture.videoStyle.getStylesOfTarget('english');
+		translationStyles.setStyle('max-height', 1);
+		translationStyles.overrides[clip.id] = { 'max-height': 1000 };
+
+		const component = render(VideoOverlay);
+		await settleOverlay();
+
+		expect(getForegroundTranslationNode(component.container, 'english')?.style.fontSize).toBe(
+			'28px'
+		);
+	});
+
+	test('shows a center grip for moving each subtitle', async () => {
+		setupVideoOverlayFixture([createVerseSubtitle(0, 999, 'Arabic', 'Translation')]);
+		const component = render(VideoOverlay);
+		await settleOverlay();
+
+		const moveHandles = component.container.querySelectorAll('.subtitle-move-handle');
+		const startDrag = vi.fn();
+		moveHandles[0]?.closest('.subtitle')?.addEventListener('mousedown', startDrag);
+		moveHandles[0]?.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, button: 0 }));
+
+		expect(moveHandles).toHaveLength(2);
+		expect(startDrag).toHaveBeenCalledOnce();
+	});
+
+	test('resizes the arabic subtitle from its preview borders and corner handles', async () => {
+		const fixture = setupVideoOverlayFixture(
+			[createVerseSubtitle(0, 999, 'Arabic', 'Translation')],
+			{ cursorPosition: 500 }
+		);
+		const beginHistory = vi.spyOn(ProjectHistoryManager, 'begin');
+		const commitHistory = vi.spyOn(ProjectHistoryManager, 'commit');
+		const component = render(VideoOverlay);
+		const overlay = component.container.querySelector('#overlay') as HTMLElement;
+		overlay.style.width = '1000px';
+		overlay.style.height = '600px';
+		await settleOverlay();
+
+		const handle = component.container.querySelector(
+			'.arabic.subtitle .subtitle-resize-edge-left'
+		) as HTMLElement;
+		const subtitlesContainer = getSubtitlesContainer(component.container)!;
+		handle.setPointerCapture = vi.fn();
+		handle.hasPointerCapture = vi.fn(() => false);
+		handle.dispatchEvent(
+			new PointerEvent('pointerdown', { bubbles: true, button: 0, clientX: 100, pointerId: 1 })
+		);
+		handle.dispatchEvent(
+			new PointerEvent('pointermove', { bubbles: true, clientX: 50, pointerId: 1 })
+		);
+		expect(subtitlesContainer.dataset.resizingTarget).toBe('arabic');
+		await tick();
+		expect(subtitlesContainer.style.opacity).toBe('1');
+		handle.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, pointerId: 1 }));
+		expect(subtitlesContainer.dataset.resizingTarget).toBeUndefined();
+
+		expect(fixture.videoStyle.getStylesOfTarget('arabic').findStyle('width').value).toBe(90);
+
+		const arabicNode = getForegroundArabicNode(component.container)!;
+		const initialRenderedHeight = arabicNode.offsetHeight;
+		const heightHandle = component.container.querySelector(
+			'.arabic.subtitle .subtitle-resize-edge-top'
+		) as HTMLElement;
+		heightHandle.setPointerCapture = vi.fn();
+		heightHandle.hasPointerCapture = vi.fn(() => false);
+		heightHandle.dispatchEvent(
+			new PointerEvent('pointerdown', { bubbles: true, button: 0, clientY: 100, pointerId: 2 })
+		);
+		heightHandle.dispatchEvent(
+			new PointerEvent('pointermove', { bubbles: true, clientY: 75, pointerId: 2 })
+		);
+		heightHandle.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, pointerId: 2 }));
+
+		expect(fixture.videoStyle.getStylesOfTarget('arabic').findStyle('max-height').value).toBe(
+			Math.min(800, Math.max(1, initialRenderedHeight + 50))
+		);
+
+		const widthBeforeCorner = Number(
+			fixture.videoStyle.getStylesOfTarget('arabic').findStyle('width').value
+		);
+		const heightBeforeCorner = Number(
+			fixture.videoStyle.getStylesOfTarget('arabic').findStyle('max-height').value
+		);
+		const topLeftHandle = component.container.querySelector(
+			'.arabic.subtitle .subtitle-resize-top-left'
+		) as HTMLElement;
+		topLeftHandle.setPointerCapture = vi.fn();
+		topLeftHandle.hasPointerCapture = vi.fn(() => false);
+		topLeftHandle.dispatchEvent(
+			new PointerEvent('pointerdown', {
+				bubbles: true,
+				button: 0,
+				clientX: 100,
+				clientY: 100,
+				pointerId: 3
+			})
+		);
+		topLeftHandle.dispatchEvent(
+			new PointerEvent('pointermove', {
+				bubbles: true,
+				clientX: 75,
+				clientY: 90,
+				pointerId: 3
+			})
+		);
+		topLeftHandle.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, pointerId: 3 }));
+
+		expect(fixture.videoStyle.getStylesOfTarget('arabic').findStyle('width').value).toBe(
+			widthBeforeCorner + 5
+		);
+		expect(fixture.videoStyle.getStylesOfTarget('arabic').findStyle('max-height').value).toBe(
+			heightBeforeCorner + 20
+		);
+		expect(beginHistory).toHaveBeenCalledTimes(3);
+		expect(beginHistory).toHaveBeenCalledWith('resize subtitle');
+		expect(commitHistory).toHaveBeenCalledTimes(3);
+	});
+
+	test('resizes only the subtitles selected in the style timeline', async () => {
+		const firstClip = createVerseSubtitle(0, 999, 'First Arabic', 'First translation');
+		const secondClip = createVerseSubtitle(1000, 1999, 'Second Arabic', 'Second translation');
+		const unselectedClip = createVerseSubtitle(2000, 2999, 'Third Arabic', 'Third translation');
+		const fixture = setupVideoOverlayFixture([firstClip, secondClip, unselectedClip], {
+			cursorPosition: 500
+		});
+		globalState.currentProject!.projectEditorState.currentTab = ProjectEditorTabs.Style;
+		globalState.getStylesState.selectedSubtitles = [firstClip, secondClip];
+
+		const component = render(VideoOverlay);
+		const overlay = component.container.querySelector('#overlay') as HTMLElement;
+		overlay.style.width = '1000px';
+		overlay.style.height = '600px';
+		await settleOverlay();
+
+		const handle = component.container.querySelector(
+			'.translation.subtitle .subtitle-resize-top-left'
+		) as HTMLElement;
+		handle.setPointerCapture = vi.fn();
+		handle.hasPointerCapture = vi.fn(() => false);
+		handle.dispatchEvent(
+			new PointerEvent('pointerdown', {
+				bubbles: true,
+				button: 0,
+				clientX: 100,
+				clientY: 100,
+				pointerId: 4
+			})
+		);
+		handle.dispatchEvent(
+			new PointerEvent('pointermove', {
+				bubbles: true,
+				clientX: 50,
+				clientY: 75,
+				pointerId: 4
+			})
+		);
+		handle.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, pointerId: 4 }));
+
+		const translationStyles = fixture.videoStyle.getStylesOfTarget('english');
+		expect(translationStyles.findStyle('width').value).toBe(80);
+		expect(translationStyles.findStyle('max-height').value).toBe(0);
+		expect(translationStyles.getEffectiveValue('width', firstClip.id)).toBe(90);
+		expect(translationStyles.getEffectiveValue('width', secondClip.id)).toBe(90);
+		expect(translationStyles.getEffectiveValue('width', unselectedClip.id)).toBe(80);
+		expect(translationStyles.getEffectiveValue('max-height', firstClip.id)).toBeGreaterThan(0);
+		expect(translationStyles.getEffectiveValue('max-height', secondClip.id)).toBe(
+			translationStyles.getEffectiveValue('max-height', firstClip.id)
+		);
+		expect(translationStyles.getEffectiveValue('max-height', unselectedClip.id)).toBe(0);
+	});
+
+	test('keeps the font layout visible and stable during a subtitle position drag', async () => {
+		setupVideoOverlayFixture([createVerseSubtitle(0, 999, 'Arabic', 'Translation')], {
+			cursorPosition: 500
+		});
+		const component = render(VideoOverlay);
+		await settleOverlay();
+		const arabicNode = getForegroundArabicNode(component.container)!;
+		const subtitlesContainer = getSubtitlesContainer(component.container)!;
+		const { mouseDrag } = await vi.importActual<typeof import('$lib/services/verticalDrag')>(
+			'$lib/services/verticalDrag'
+		);
+		const refreshPreview = vi.spyOn(globalState, 'updateVideoPreviewUI');
+		const action = mouseDrag(arabicNode, {
+			target: 'arabic',
+			verticalStyleId: 'vertical-position',
+			horizontalStyleId: 'horizontal-position'
+		});
+
+		arabicNode.dispatchEvent(
+			new MouseEvent('mousedown', { bubbles: true, button: 0, clientX: 100, clientY: 100 })
+		);
+		document.dispatchEvent(
+			new MouseEvent('mousemove', { bubbles: true, clientX: 120, clientY: 120 })
+		);
+		expect(subtitlesContainer.dataset.positionDragTarget).toBe('arabic');
+		expect(refreshPreview).not.toHaveBeenCalled();
+		globalState.getTimelineState.previewRefreshToken += 1;
+		await tick();
+		expect(subtitlesContainer.style.opacity).toBe('1');
+
+		document.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+		expect(refreshPreview).toHaveBeenCalledOnce();
+		expect(subtitlesContainer.dataset.positionDragTarget).toBeUndefined();
+		await settleOverlay();
+		expect(subtitlesContainer.dataset.positionDragCommit).toBeUndefined();
+		expect(subtitlesContainer.style.opacity).toBe('1');
+		action.destroy();
+	});
+
+	test('moves an imported SRT translation with spaces in its name below Arabic', async () => {
+		const edition = '_MConverter.eu_ali imran çeviri.srt';
+		const clip = createVerseSubtitle(0, 999, 'Arabic', 'Translation');
+		clip.translations = { [edition]: clip.translations.english };
+		const fixture = setupVideoOverlayFixture([clip], { cursorPosition: 500 });
+		const globalStyles = fixture.videoStyle.getStylesOfTarget('global');
+		globalStyles.setStyle('anti-collision', true);
+		globalStyles.setStyle('spacing', 9);
+		fixture.videoStyle.getStylesOfTarget('arabic').generateCSS = () =>
+			'position: absolute; top: 0; width: 100px; height: 50px;';
+		fixture.videoStyle.getStylesOfTarget(edition).generateCSS = () =>
+			'position: absolute; top: 40px; width: 100px; height: 50px; transform: translateY(var(--reactive-y-position, 0px));';
+
+		const component = render(VideoOverlay);
+		await settleOverlay();
+		const arabicNode = getForegroundArabicNode(component.container)!;
+		const translationNode = component.container.querySelector<HTMLElement>(
+			'#subtitles-container .translation.subtitle'
+		)!;
+
+		await vi.waitFor(() => {
+			expect(translationNode.getBoundingClientRect().top).toBeGreaterThanOrEqual(
+				arabicNode.getBoundingClientRect().bottom + 9
+			);
+		});
+	});
+
+	test('keeps the anti-collision offset when a subtitle is repositioned', async () => {
+		const fixture = setupVideoOverlayFixture(
+			[createVerseSubtitle(0, 999, 'Arabic', 'Translation')],
+			{ cursorPosition: 500 }
+		);
+		const component = render(VideoOverlay);
+		await settleOverlay();
+		const arabicNode = getForegroundArabicNode(component.container)!;
+		arabicNode.style.setProperty('--reactive-y-position', '30px');
+		const { mouseDrag } = await vi.importActual<typeof import('$lib/services/verticalDrag')>(
+			'$lib/services/verticalDrag'
+		);
+		const action = mouseDrag(arabicNode, {
+			target: 'arabic',
+			verticalStyleId: 'vertical-position',
+			horizontalStyleId: 'horizontal-position'
+		});
+
+		arabicNode.dispatchEvent(
+			new MouseEvent('mousedown', { bubbles: true, button: 0, clientX: 100, clientY: 100 })
+		);
+		document.dispatchEvent(
+			new MouseEvent('mousemove', { bubbles: true, clientX: 100, clientY: 120 })
+		);
+		document.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+
+		expect(
+			fixture.videoStyle.getStylesOfTarget('arabic').findStyle('vertical-position').value
+		).toBe(50);
+		action.destroy();
+	});
+
+	test('highlights both subtitle boxes and shows the anti-collision message during a collision', async () => {
+		const fixture = setupVideoOverlayFixture(
+			[createVerseSubtitle(0, 999, 'Arabic', 'Translation')],
+			{ cursorPosition: 500 }
+		);
+		fixture.videoStyle.getStylesOfTarget('global').setStyle('anti-collision', true);
+		const component = render(VideoOverlay);
+		await settleOverlay();
+		const arabicNode = getForegroundArabicNode(component.container)!;
+		const translationNode = getForegroundTranslationNode(component.container, 'english')!;
+		const subtitlesContainer = getSubtitlesContainer(component.container)!;
+		vi.spyOn(arabicNode, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 100, 50));
+		vi.spyOn(translationNode, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 40, 100, 50));
+		const { mouseDrag } = await vi.importActual<typeof import('$lib/services/verticalDrag')>(
+			'$lib/services/verticalDrag'
+		);
+		const action = mouseDrag(arabicNode, {
+			target: 'arabic',
+			verticalStyleId: 'vertical-position',
+			horizontalStyleId: 'horizontal-position'
+		});
+
+		arabicNode.dispatchEvent(
+			new MouseEvent('mousedown', { bubbles: true, button: 0, clientX: 100, clientY: 100 })
+		);
+		document.dispatchEvent(
+			new MouseEvent('mousemove', { bubbles: true, clientX: 120, clientY: 120 })
+		);
+		await new Promise(requestAnimationFrame);
+
+		expect(arabicNode.classList.contains('position-drag-collision')).toBe(true);
+		expect(translationNode.classList.contains('position-drag-collision')).toBe(true);
+		expect(subtitlesContainer.dataset.positionDragCollision).toBe('true');
+		const notice = component.container.querySelector('.anti-collision-drag-notice') as HTMLElement;
+		expect(notice.getAttribute('role')).toBe('status');
+		expect(getComputedStyle(notice).display).toBe('block');
+
+		document.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+		expect(arabicNode.classList.contains('position-drag-collision')).toBe(false);
+		expect(translationNode.classList.contains('position-drag-collision')).toBe(false);
+		expect(subtitlesContainer.dataset.positionDragCollision).toBeUndefined();
+		action.destroy();
+	});
+
+	test('keeps QPC2 verse-number fonts when merged verses stay on the same page', async () => {
+		seedQpc2PreviewFixture();
+		const firstClip = createLastWordsQpcSubtitle(0, 999, 1, 1, 0, 3);
+		const secondClip = createLastWordsQpcSubtitle(1000, 1999, 1, 2, 0, 3);
+		applyVisualMerge([firstClip, secondClip], 'arabic');
+		const fixture = setupVideoOverlayFixture([firstClip, secondClip], { cursorPosition: 1100 });
+		fixture.videoStyle.getStylesOfTarget('arabic').setStyle('font-family', 'QPC2');
+		fixture.videoStyle.getStylesOfTarget('arabic').setStyle('show-verse-number', true);
+
+		const component = render(VideoOverlay);
+		await settleOverlay();
+
+		const verseNumberSpans = getArabicVerseNumberSpans(component.container);
+		expect(verseNumberSpans).toHaveLength(2);
+		expect(verseNumberSpans.map((span) => span.textContent)).toEqual([' ﱅ', ' ﱊ']);
+		expect(
+			verseNumberSpans.every((span) => span.getAttribute('style')?.includes('QPC2_p001'))
+		).toBe(true);
+	});
+
+	test('keeps QPC2 verse-number fonts on merged clips with arabic inline styles', async () => {
+		seedQpc2PreviewFixture();
+		const firstClip = createLastWordsQpcSubtitle(0, 999, 71, 10, 3, 5);
+		const secondClip = createLastWordsQpcSubtitle(1000, 1999, 71, 11, 0, 3);
+		firstClip.toggleArabicInlineStyles(0, 0, {
+			bold: true,
+			italic: false,
+			underline: false,
+			color: null
+		});
+		secondClip.toggleArabicInlineStyles(0, 1, {
+			bold: false,
+			italic: false,
+			underline: true,
+			color: '#ff0000'
+		});
+		applyVisualMerge([firstClip, secondClip], 'arabic');
+		const fixture = setupVideoOverlayFixture([firstClip, secondClip], { cursorPosition: 1100 });
+		fixture.videoStyle.getStylesOfTarget('arabic').setStyle('font-family', 'QPC2');
+		fixture.videoStyle.getStylesOfTarget('arabic').setStyle('show-verse-number', true);
+
+		const component = render(VideoOverlay);
+		await settleOverlay();
+
+		const verseNumberSpans = getArabicVerseNumberSpans(component.container);
+		expect(verseNumberSpans).toHaveLength(2);
+		expect(verseNumberSpans.map((span) => span.getAttribute('style'))).toEqual([
+			expect.stringContaining('font-family: QPC2_p570'),
+			expect.stringContaining('font-family: QPC2_p571')
+		]);
+		expect(
+			verseNumberSpans.every((span) => !span.getAttribute('style')?.includes('font-weight'))
+		).toBe(true);
+	});
+
+	test('keeps Tajweed verse-number fonts per page on merged QPC2 glyphs', async () => {
+		seedQpc2PreviewFixture();
+		const firstClip = createLastWordsQpcSubtitle(0, 999, 71, 10, 3, 5);
+		const secondClip = createLastWordsQpcSubtitle(1000, 1999, 71, 11, 0, 3);
+		applyVisualMerge([firstClip, secondClip], 'arabic');
+		const fixture = setupVideoOverlayFixture([firstClip, secondClip], { cursorPosition: 1100 });
+		fixture.videoStyle.getStylesOfTarget('arabic').setStyle('mushaf-style', 'Tajweed');
+		fixture.videoStyle.getStylesOfTarget('arabic').setStyle('show-verse-number', true);
+
+		const component = render(VideoOverlay);
+		await settleOverlay();
+
+		expect(
+			getArabicVerseNumberSpans(component.container).map((span) => span.getAttribute('style'))
+		).toEqual([
+			expect.stringContaining('font-family: p570-v4, QPC2_p570'),
+			expect.stringContaining('font-family: p571-v4, QPC2_p571')
+		]);
+	});
+
+	test('uses the whole merged group for fade timing on merged targets', async () => {
+		const firstClip = createVerseSubtitle(0, 999, 'Alpha Arabic', 'Alpha translation');
+		const secondClip = createVerseSubtitle(1000, 1999, 'Beta Arabic', 'Beta translation');
+		applyVisualMerge([firstClip, secondClip], 'arabic');
+		const fixture = setupVideoOverlayFixture([firstClip, secondClip], { cursorPosition: 1100 });
+
+		const component = render(VideoOverlay);
+		await settleOverlay();
+
+		const arabicNode = getForegroundArabicNode(component.container);
+		expect(arabicNode).not.toBeNull();
+		expect(arabicNode!.style.opacity).toBe('1');
+
+		await fixture.setCursor(1950);
+		await settleOverlay();
+		expect(Number(arabicNode!.style.opacity)).toBeLessThan(1);
+		expect(Number(arabicNode!.style.opacity)).toBeGreaterThan(0);
+	});
+
+	test('keeps subtitle backgrounds anchored to the nearest subtitle outside active playback windows', async () => {
+		const firstClip = createVerseSubtitle(
+			500,
+			700,
+			'First Background',
+			'First background translation'
+		);
+		const secondClip = createVerseSubtitle(
+			1000,
+			1200,
+			'Second Background',
+			'Second background translation'
+		);
+		const fixture = setupVideoOverlayFixture([firstClip, secondClip], { cursorPosition: 100 });
+
+		const component = render(VideoOverlay);
+		await settleOverlay();
+
+		const backgroundArabic = getBackgroundArabicNode(component.container);
+		expect(backgroundArabic).not.toBeNull();
+		expect(backgroundArabic!.getAttribute('style')).toContain(`--mock-clip-id: ${firstClip.id}`);
+
+		await fixture.setCursor(850);
+		await settleOverlay();
+		expect(backgroundArabic!.getAttribute('style')).toContain(`--mock-clip-id: ${firstClip.id}`);
+
+		await fixture.setCursor(1400);
+		await settleOverlay();
+		expect(backgroundArabic!.getAttribute('style')).toContain(`--mock-clip-id: ${secondClip.id}`);
+	});
+});
+
+describe('Decorative brackets', () => {
+	afterEach(() => {
+		cleanup();
+		vi.restoreAllMocks();
+		globalState.currentProject = null;
+		globalState.settings = undefined;
+	});
+
+	test('shows decorative brackets when enabled', async () => {
+		const fixture = setupVideoOverlayFixture(
+			[createVerseSubtitle(0, 999, 'Test Arabic', 'Test translation')],
+			{ cursorPosition: 500 }
+		);
+		fixture.videoStyle.getStylesOfTarget('arabic').setStyle('show-decorative-brackets', true);
+
+		const component = render(VideoOverlay);
+		await settleOverlay();
+
+		const arabicNode = getForegroundArabicNode(component.container);
+		expect(arabicNode).not.toBeNull();
+		expect(arabicNode!.getAttribute('dir')).toBe('rtl');
+		const bracketSpans = arabicNode!.querySelectorAll('span[style*="QPC2BSML"]');
+		expect(bracketSpans.length).toBe(2); // ouvrant + fermant
+	});
+
+	test('does not show decorative brackets when disabled', async () => {
+		const fixture = setupVideoOverlayFixture(
+			[createVerseSubtitle(0, 999, 'Test Arabic', 'Test translation')],
+			{ cursorPosition: 500 }
+		);
+		fixture.videoStyle.getStylesOfTarget('arabic').setStyle('show-decorative-brackets', false);
+
+		const component = render(VideoOverlay);
+		await settleOverlay();
+
+		const arabicNode = getForegroundArabicNode(component.container);
+		expect(arabicNode).not.toBeNull();
+		const bracketSpans = arabicNode!.querySelectorAll('span[style*="QPC2BSML"]');
+		expect(bracketSpans.length).toBe(0);
+	});
+
+	test('shows configured bracket glyph pair (NO)', async () => {
+		const fixture = setupVideoOverlayFixture(
+			[createVerseSubtitle(0, 999, 'Test Arabic', 'Test translation')],
+			{ cursorPosition: 500 }
+		);
+		fixture.videoStyle.getStylesOfTarget('arabic').setStyle('show-decorative-brackets', true);
+		fixture.videoStyle
+			.getStylesOfTarget('arabic')
+			.setStyle('decorative-brackets-font-family', 'NO');
+
+		const component = render(VideoOverlay);
+		await settleOverlay();
+
+		const arabicNode = getForegroundArabicNode(component.container);
+		expect(arabicNode).not.toBeNull();
+		const text = normalizeText(arabicNode!.textContent);
+		expect(text).toMatch(/^N\s.*\sO$/);
+	});
+
+	test('falls back to LM pair when bracket style is not explicitly set', async () => {
+		const fixture = setupVideoOverlayFixture(
+			[createVerseSubtitle(0, 999, 'Test Arabic', 'Test translation')],
+			{ cursorPosition: 500 }
+		);
+		fixture.videoStyle.getStylesOfTarget('arabic').setStyle('show-decorative-brackets', true);
+
+		const component = render(VideoOverlay);
+		await settleOverlay();
+
+		const arabicNode = getForegroundArabicNode(component.container);
+		const text = normalizeText(arabicNode!.textContent);
+		expect(text).toMatch(/^L\s.*\sM$/);
+	});
+});
+
+describe('Overlay effect', () => {
+	afterEach(() => {
+		cleanup();
+		vi.restoreAllMocks();
+		globalState.currentProject = null;
+		globalState.settings = undefined;
+	});
+
+	test('shows overlay layer when enabled', async () => {
+		const fixture = setupVideoOverlayFixture(
+			[createVerseSubtitle(0, 999, 'Arabic', 'Translation')],
+			{ cursorPosition: 500 }
+		);
+		const globalStyles = fixture.videoStyle.getStylesOfTarget('global');
+		globalStyles.setStyle('overlay-enable', true);
+		globalStyles.setStyle('overlay-opacity', 0.5);
+		globalStyles.setStyle('overlay-color', '#FF0000');
+
+		const component = render(VideoOverlay);
+		await settleOverlay();
+
+		// La couche d'overlay est le premier div avec backdrop-filter ou background-color
+		const overlayEl = component.container.querySelector(
+			'#overlay > div[style*="background-color"]'
+		);
+		expect(overlayEl).not.toBeNull();
+	});
+
+	test('does not show overlay when disabled', async () => {
+		const fixture = setupVideoOverlayFixture(
+			[createVerseSubtitle(0, 999, 'Arabic', 'Translation')],
+			{ cursorPosition: 500 }
+		);
+		fixture.videoStyle.getStylesOfTarget('global').setStyle('overlay-enable', false);
+
+		const component = render(VideoOverlay);
+		await settleOverlay();
+
+		const blurEls = component.container.querySelectorAll('[style*="backdrop-filter"]');
+		expect(blurEls.length).toBe(0);
+	});
+
+	test('applies blur when overlay is enabled', async () => {
+		const fixture = setupVideoOverlayFixture(
+			[createVerseSubtitle(0, 999, 'Arabic', 'Translation')],
+			{ cursorPosition: 500 }
+		);
+		const globalStyles = fixture.videoStyle.getStylesOfTarget('global');
+		globalStyles.setStyle('overlay-enable', true);
+		globalStyles.setStyle('overlay-blur', 5);
+
+		const component = render(VideoOverlay);
+		await settleOverlay();
+
+		const blurEl = component.container.querySelector('[style*="backdrop-filter"]');
+		expect(blurEl).not.toBeNull();
+		expect(blurEl!.getAttribute('style')).toContain('blur(5px)');
+	});
+
+	test('applies gradient overlay for fade-up mode', async () => {
+		const fixture = setupVideoOverlayFixture(
+			[createVerseSubtitle(0, 999, 'Arabic', 'Translation')],
+			{ cursorPosition: 500 }
+		);
+		const globalStyles = fixture.videoStyle.getStylesOfTarget('global');
+		globalStyles.setStyle('overlay-enable', true);
+		globalStyles.setStyle('background-overlay-mode', 'fade-up');
+		globalStyles.setStyle('overlay-opacity', 1);
+
+		const component = render(VideoOverlay);
+		await settleOverlay();
+
+		const overlayEl = component.container.querySelector('#overlay > div[style*="linear-gradient"]');
+		expect(overlayEl).not.toBeNull();
+	});
+
+	test.each([
+		['fade-left', 'linear-gradient'],
+		['fade-four-corners', 'radial-gradient'],
+		['fade-four-sides', 'linear-gradient'],
+		['fade-vignette', 'radial-gradient']
+	])('applies the shared overlay renderer for %s mode', async (mode, gradientType) => {
+		const fixture = setupVideoOverlayFixture(
+			[createVerseSubtitle(0, 999, 'Arabic', 'Translation')],
+			{ cursorPosition: 500 }
+		);
+		const globalStyles = fixture.videoStyle.getStylesOfTarget('global');
+		globalStyles.setStyle('overlay-enable', true);
+		globalStyles.setStyle('background-overlay-mode', mode);
+		globalStyles.setStyle('overlay-opacity', 1);
+		globalStyles.setStyle('background-overlay-fade-intensity', 1);
+		globalStyles.setStyle('background-overlay-fade-coverage', 0.75);
+
+		const component = render(VideoOverlay);
+		await settleOverlay();
+
+		expect(
+			component.container.querySelector(`#overlay > div[style*="${gradientType}"]`)
+		).not.toBeNull();
+	});
+});
+
+describe('Subtitle opacity / fade', () => {
+	afterEach(() => {
+		cleanup();
+		vi.restoreAllMocks();
+		globalState.currentProject = null;
+		globalState.settings = undefined;
+	});
+
+	test('subtitle is fully opaque in the middle of its time range', async () => {
+		const _fixture = setupVideoOverlayFixture(
+			[createVerseSubtitle(0, 1000, 'Arabic', 'Translation')],
+			{ cursorPosition: 500 }
+		);
+
+		const component = render(VideoOverlay);
+		await settleOverlay();
+
+		const arabicNode = getForegroundArabicNode(component.container);
+		expect(arabicNode).not.toBeNull();
+		expect(Number(arabicNode!.style.opacity)).toBe(1);
+	});
+
+	test('subtitle fades in at the beginning of its time range', async () => {
+		const _fixture = setupVideoOverlayFixture(
+			[createVerseSubtitle(0, 1000, 'Arabic', 'Translation')],
+			{ cursorPosition: 50 }
+		);
+
+		const component = render(VideoOverlay);
+		await settleOverlay();
+
+		const arabicNode = getForegroundArabicNode(component.container);
+		expect(arabicNode).not.toBeNull();
+		const opacity = Number(arabicNode!.style.opacity);
+		expect(opacity).toBeGreaterThan(0);
+		expect(opacity).toBeLessThan(1);
+	});
+
+	test('subtitle fades out at the end of its time range', async () => {
+		const _fixture = setupVideoOverlayFixture(
+			[createVerseSubtitle(0, 1000, 'Arabic', 'Translation')],
+			{ cursorPosition: 950 }
+		);
+
+		const component = render(VideoOverlay);
+		await settleOverlay();
+
+		const arabicNode = getForegroundArabicNode(component.container);
+		expect(arabicNode).not.toBeNull();
+		const opacity = Number(arabicNode!.style.opacity);
+		expect(opacity).toBeGreaterThan(0);
+		expect(opacity).toBeLessThan(1);
+	});
+
+	test('subtitle opacity respects the configured opacity style value', async () => {
+		const fixture = setupVideoOverlayFixture(
+			[createVerseSubtitle(0, 1000, 'Arabic', 'Translation')],
+			{ cursorPosition: 500 }
+		);
+		fixture.videoStyle.getStylesOfTarget('arabic').setStyle('opacity', 0.7);
+
+		const component = render(VideoOverlay);
+		await settleOverlay();
+
+		const arabicNode = getForegroundArabicNode(component.container);
+		expect(Number(arabicNode!.style.opacity)).toBe(0.7);
+	});
+});
+
+describe('Alignment grid', () => {
+	afterEach(() => {
+		cleanup();
+		vi.restoreAllMocks();
+		globalState.currentProject = null;
+		globalState.settings = undefined;
+	});
+
+	test('does not show alignment grid by default in VideoEditor tab', async () => {
+		setupVideoOverlayFixture([createVerseSubtitle(0, 999, 'Arabic', 'Translation')], {
+			cursorPosition: 500
+		});
+
+		const component = render(VideoOverlay);
+		await settleOverlay();
+
+		const gridEl = component.container.querySelector('.alignment-overlay');
+		expect(gridEl).toBeNull();
+	});
+
+	test('shows alignment grid when enabled in Style tab', async () => {
+		const _fixture = setupVideoOverlayFixture(
+			[createVerseSubtitle(0, 999, 'Arabic', 'Translation')],
+			{ cursorPosition: 500 }
+		);
+		globalState.currentProject!.projectEditorState.currentTab = ProjectEditorTabs.Style;
+		globalState.getVideoPreviewState.showAlignmentGrid = true;
+
+		const component = render(VideoOverlay);
+		await settleOverlay();
+
+		const gridEl = component.container.querySelector('.alignment-overlay');
+		expect(gridEl).not.toBeNull();
+	});
+});
+
+describe('Subtitle image', () => {
+	afterEach(() => {
+		cleanup();
+		vi.restoreAllMocks();
+		globalState.currentProject = null;
+		globalState.settings = undefined;
+	});
+
+	test('does not show image when subtitle has no associated image', async () => {
+		setupVideoOverlayFixture([createVerseSubtitle(0, 999, 'Arabic', 'Translation')], {
+			cursorPosition: 500
+		});
+
+		const component = render(VideoOverlay);
+		await settleOverlay();
+
+		const imgEls = component.container.querySelectorAll('[style*="background-image"]');
+		expect(imgEls.length).toBe(0);
+	});
+});
+
+describe('Word-by-word highlight', () => {
+	afterEach(() => {
+		cleanup();
+		vi.restoreAllMocks();
+		globalState.currentProject = null;
+		globalState.settings = undefined;
+	});
+
+	test('renders standard arabic flow without WBW when disabled', async () => {
+		const _fixture = setupVideoOverlayFixture(
+			[createVerseSubtitle(0, 999, 'Simple Arabic Text', 'Translation')],
+			{ cursorPosition: 500 }
+		);
+
+		const component = render(VideoOverlay);
+		await settleOverlay();
+
+		const arabicNode = getForegroundArabicNode(component.container);
+		expect(arabicNode).not.toBeNull();
+		const wbwFlow = arabicNode!.querySelector('.arabic-wbw-flow');
+		expect(wbwFlow).toBeNull();
+	});
+
+	test('inherits global line geometry and rounds only persistent WBW sequence ends', async () => {
+		const clip = createVerseSubtitle(0, 2999, 'one two three', 'Translation');
+		clip.alignmentMetadata = {
+			source: 'local',
+			segment: 0,
+			refFrom: '1:1:1',
+			refTo: '1:1:3',
+			matchedText: clip.text,
+			timeFrom: 0,
+			timeTo: 3,
+			words: [
+				{ location: '1:1:1', start: 0, end: 1 },
+				{ location: '1:1:2', start: 1, end: 2 },
+				{ location: '1:1:3', start: 2, end: 3 }
+			]
+		};
+		const fixture = setupVideoOverlayFixture([clip], { cursorPosition: 2500 });
+		const arabicStyles = fixture.videoStyle.getStylesOfTarget('arabic');
+		arabicStyles.setStyle('enable-wbw-line-background', true);
+		arabicStyles.setStyle('wbw-line-background-color', '#ff0000');
+		arabicStyles.setStyle('wbw-line-background-height', 20);
+		arabicStyles.setStyle('wbw-persist-color', true);
+		arabicStyles.setStyle('line-background-enable', true);
+		arabicStyles.setStyle('line-background-height', 64);
+		arabicStyles.setStyle('line-background-position', 18);
+
+		const component = render(VideoOverlay);
+		await settleOverlay();
+
+		const bars = Array.from(
+			component.container.querySelectorAll<HTMLElement>('.arabic-wbw-group > .wbw-line-background')
+		);
+		expect(bars).toHaveLength(3);
+		expect(bars[0].classList.contains('wbw-line-background-start')).toBe(true);
+		expect(bars[1].className).toBe('wbw-line-background');
+		expect(bars[2].classList.contains('wbw-line-background-end')).toBe(true);
+		expect(bars[2].style.getPropertyValue('--wbw-line-background-height')).toBe('64px');
+		expect(bars[2].style.getPropertyValue('--wbw-line-background-position')).toBe('18px');
+	});
+
+	test('joins translation units mapped to the same current WBW word', async () => {
+		const clip = createVerseSubtitle(0, 1999, 'one two', 'Several translated words next');
+		clip.alignmentMetadata = {
+			source: 'local',
+			segment: 0,
+			refFrom: '1:1:1',
+			refTo: '1:1:2',
+			matchedText: clip.text,
+			timeFrom: 0,
+			timeTo: 2,
+			words: [
+				{ location: '1:1:1', start: 0, end: 1 },
+				{ location: '1:1:2', start: 1, end: 2 }
+			]
+		};
+		const translation = clip.translations.english as VerseTranslation;
+		translation.setWbwRange(0, 0, 2);
+		translation.setWbwRange(1, 3, 3);
+		const fixture = setupVideoOverlayFixture([clip], { cursorPosition: 500 });
+		const translationStyles = fixture.videoStyle.getStylesOfTarget('english');
+		translationStyles.setStyle('enable-wbw-line-background', true);
+		translationStyles.setStyle('wbw-line-background-color', '#ff0000');
+		translationStyles.setStyle('wbw-line-background-height', 30);
+		translationStyles.setStyle('wbw-line-background-position', 10);
+
+		const component = render(VideoOverlay);
+		await settleOverlay();
+
+		const bars = Array.from(
+			component.container.querySelectorAll<HTMLElement>('.translation.english .wbw-line-background')
+		);
+		expect(bars).toHaveLength(3);
+		expect(bars[0].classList.contains('wbw-line-background-start')).toBe(true);
+		expect(bars[1].className).toBe('wbw-line-background');
+		expect(bars[2].classList.contains('wbw-line-background-end')).toBe(true);
+	});
+
+	test('re-highlights overlapping words in the next merged clip', async () => {
+		const firstClip = new SubtitleClip(0, 2999, 1, 1, 0, 2, 'w1 w2 w3', [], false, false);
+		firstClip.alignmentMetadata = {
+			source: 'local',
+			segment: 0,
+			refFrom: '1:1:1',
+			refTo: '1:1:3',
+			matchedText: firstClip.text,
+			timeFrom: 0,
+			timeTo: 3,
+			words: [
+				{ location: '1:1:1', start: 0, end: 0.5 },
+				{ location: '1:1:2', start: 0.5, end: 1 },
+				{ location: '1:1:3', start: 1, end: 3 }
+			]
+		};
+		const secondClip = new SubtitleClip(3000, 5999, 1, 1, 1, 3, 'w2 w3 w4', [], false, false);
+		secondClip.alignmentMetadata = {
+			source: 'local',
+			segment: 1,
+			refFrom: '1:1:2',
+			refTo: '1:1:4',
+			matchedText: secondClip.text,
+			timeFrom: 0,
+			timeTo: 3,
+			words: [
+				{ location: '1:1:2', start: 0, end: 0.75 },
+				{ location: '1:1:3', start: 0.75, end: 1.5 },
+				{ location: '1:1:4', start: 1.5, end: 3 }
+			]
+		};
+		applyVisualMerge([firstClip, secondClip], 'arabic');
+		const fixture = setupVideoOverlayFixture([firstClip, secondClip], { cursorPosition: 3100 });
+		fixture.videoStyle.getStylesOfTarget('arabic').setStyle('enable-wbw-highlight', true);
+		fixture.videoStyle.getStylesOfTarget('arabic').setStyle('text-color', '#000000');
+		fixture.videoStyle.getStylesOfTarget('arabic').setStyle('wbw-color', '#ff0000');
+		fixture.videoStyle.getStylesOfTarget('global').setStyle('fade-duration', 200);
+
+		const component = render(VideoOverlay);
+		await settleOverlay();
+
+		let wordSpans = Array.from(
+			component.container.querySelectorAll<HTMLElement>('.arabic-wbw-group > span')
+		);
+		expect(wordSpans.filter((span) => span.textContent?.trim() === 'w2')).toHaveLength(1);
+		const enteringWordColor = wordSpans.find((span) => span.textContent?.trim() === 'w2')?.style
+			.color;
+		const leavingWordColor = wordSpans.find((span) => span.textContent?.trim() === 'w3')?.style
+			.color;
+		expect(enteringWordColor).not.toBe('rgb(0, 0, 0)');
+		expect(enteringWordColor).not.toBe('rgb(255, 0, 0)');
+		expect(leavingWordColor).not.toBe('rgb(0, 0, 0)');
+		expect(leavingWordColor).not.toBe('rgb(255, 0, 0)');
+
+		await fixture.setCursor(3250);
+
+		wordSpans = Array.from(
+			component.container.querySelectorAll<HTMLElement>('.arabic-wbw-group > span')
+		);
+		expect(wordSpans.find((span) => span.textContent?.trim() === 'w2')?.style.color).toBe(
+			'rgb(255, 0, 0)'
+		);
+
+		await fixture.setCursor(4000);
+
+		wordSpans = Array.from(
+			component.container.querySelectorAll<HTMLElement>('.arabic-wbw-group > span')
+		);
+		expect(wordSpans.find((span) => span.textContent?.trim() === 'w2')?.style.color).not.toBe(
+			'rgb(255, 0, 0)'
+		);
+		expect(wordSpans.find((span) => span.textContent?.trim() === 'w3')?.style.color).toBe(
+			'rgb(255, 0, 0)'
+		);
+	});
+
+	test('keeps grouped Minimal Quran words in current-word-only mode', async () => {
+		const minimalWords = [
+			'إِنّا',
+			'أَنذَرناكُم',
+			'عَذابًا',
+			'قَريبًا',
+			'يَومَ',
+			'يَنظُرُ',
+			'المَرءُ',
+			'ما',
+			'قَدَّمَت',
+			'يَداهُ',
+			'وَيَقولُ',
+			'الكافِرُ',
+			'يا لَيتَني',
+			'كُنتُ',
+			'تُرابًا'
+		];
+		vi.spyOn(MinimalQuranProvider, 'getVerseWordsSlice').mockReturnValue(minimalWords);
+		const clip = new SubtitleClip(
+			0,
+			1499,
+			78,
+			40,
+			0,
+			14,
+			Array.from({ length: 15 }, (_, index) => `word-${index}`).join(' '),
+			[],
+			true,
+			true
+		);
+		clip.alignmentMetadata = {
+			source: 'local',
+			segment: 0,
+			refFrom: '78:40:1',
+			refTo: '78:40:15',
+			matchedText: clip.text,
+			timeFrom: 0,
+			timeTo: 1.5,
+			words: minimalWords.map((_, index) => ({
+				location: `78:40:${index + 1}`,
+				start: index / 10,
+				end: (index + 1) / 10
+			}))
+		};
+		const fixture = setupVideoOverlayFixture([clip], { cursorPosition: 1250 });
+		const arabicStyles = fixture.videoStyle.getStylesOfTarget('arabic');
+		arabicStyles.setStyle('mushaf-style', 'Minimal Quran');
+		arabicStyles.setStyle('wbw-show-current-word-only', true);
+
+		const component = render(VideoOverlay);
+		await settleOverlay();
+
+		expect(normalizeText(getForegroundArabicNode(component.container)?.textContent)).toBe(
+			'يا لَيتَني'
+		);
+	});
+
+	test('refreshes the Warsh text after its local data finishes loading', async () => {
+		const clip = new SubtitleClip(
+			0,
+			999,
+			57,
+			24,
+			0,
+			11,
+			'ٱلَّذِينَ يَبۡخَلُونَ وَيَأۡمُرُونَ ٱلنَّاسَ بِٱلۡبُخۡلِۗ وَمَن يَتَوَلَّ فَإِنَّ ٱللَّهَ هُوَ ٱلۡغَنِيُّ ٱلۡحَمِيدُ',
+			[],
+			true,
+			true
+		);
+		const getVerseSlice = vi.spyOn(RiwayahProvider, 'getVerseSlice').mockReturnValue(null);
+		const fixture = setupVideoOverlayFixture([clip], { cursorPosition: 500 });
+		fixture.videoStyle.getStylesOfTarget('arabic').setStyle('riwayah', 'Warsh');
+		const component = render(VideoOverlay);
+		await settleOverlay();
+
+		expect(normalizeText(getForegroundArabicNode(component.container)?.textContent)).toContain(
+			'هُوَ'
+		);
+
+		getVerseSlice.mockReturnValue({
+			text: 'اِ۬لذِينَ يَبْخَلُونَ وَيَامُرُونَ اَ۬لنَّاسَ بِالْبُخْلِۖ وَمَنْ يَّتَوَلَّ فَإِنَّ اَ۬للَّهَ اَ۬لْغَنِيُّ اُ۬لْحَمِيدُۖ',
+			words: [
+				'اِ۬لذِينَ',
+				'يَبْخَلُونَ',
+				'وَيَامُرُونَ',
+				'اَ۬لنَّاسَ',
+				'بِالْبُخْلِۖ',
+				'وَمَنْ',
+				'يَّتَوَلَّ',
+				'فَإِنَّ',
+				'اَ۬للَّهَ',
+				'اَ۬لْغَنِيُّ',
+				'اُ۬لْحَمِيدُۖ'
+			],
+			sourceWordIndexes: [[0], [1], [2], [3], [4], [5], [6], [7], [8], [9, 10], [11]],
+			suffix: '',
+			targetAyahs: [23],
+			relation: 'mapped'
+		});
+		globalState.updateVideoPreviewUI();
+		await settleOverlay();
+
+		expect(normalizeText(getForegroundArabicNode(component.container)?.textContent)).not.toContain(
+			'هُوَ'
+		);
+		expect(normalizeText(getForegroundArabicNode(component.container)?.textContent)).toContain(
+			'اَ۬لْغَنِيُّ'
+		);
+	});
+
+	test('renders predefined subtitle text in a single segment', async () => {
+		const basmala = createPredefinedSubtitle(0, 999, 'Basmala', 'Translation');
+		setupVideoOverlayFixture([basmala], { cursorPosition: 500 });
+
+		const component = render(VideoOverlay);
+		await settleOverlay();
+
+		const arabicNode = getForegroundArabicNode(component.container);
+		expect(arabicNode).not.toBeNull();
+		expect(normalizeText(arabicNode!.textContent)).toBe(normalizeText(basmala.getText()));
+	});
+
+	test('falls back to standard arabic when a merged group has partial WBW timestamps', async () => {
+		const firstClip = createVerseSubtitle(0, 999, 'Alpha Beta', 'Alpha translation');
+		const secondClip = createVerseSubtitle(1000, 1999, 'Gamma Delta', 'Beta translation');
+		firstClip.alignmentMetadata = {
+			source: 'local',
+			segment: 0,
+			refFrom: '1:1:1',
+			refTo: '1:1:2',
+			matchedText: firstClip.text,
+			timeFrom: 0,
+			timeTo: 1,
+			words: [
+				{ location: '1:1:1', start: 0, end: 0.5 },
+				{ location: '1:1:2', start: 0.5, end: 1 }
+			]
+		};
+		applyVisualMerge([firstClip, secondClip], 'arabic');
+		const fixture = setupVideoOverlayFixture([firstClip, secondClip], { cursorPosition: 500 });
+		fixture.videoStyle.getStylesOfTarget('arabic').setStyle('enable-wbw-highlight', true);
+
+		const component = render(VideoOverlay);
+		await settleOverlay();
+
+		const arabicNode = getForegroundArabicNode(component.container);
+		expect(arabicNode).not.toBeNull();
+		expect(arabicNode!.querySelector('.arabic-wbw-flow')).toBeNull();
+		expect(normalizeText(arabicNode!.textContent)).toContain('Alpha Beta');
+	});
+});
+
+describe('Translation inline styles', () => {
+	afterEach(() => {
+		cleanup();
+		vi.restoreAllMocks();
+		globalState.currentProject = null;
+		globalState.settings = undefined;
+	});
+
+	test('renders translation with bold inline style', async () => {
+		const clip = new SubtitleClip(0, 999, 1, 1, 0, 2, 'Arabic text', [], false, false, {
+			english: new VerseTranslation('Bold translation word', 'reviewed')
+		});
+		const verseTrans = clip.translations['english'] as VerseTranslation;
+		verseTrans.inlineStyleRuns = [
+			{
+				startWordIndex: 0,
+				endWordIndex: 0,
+				bold: true,
+				italic: false,
+				underline: false,
+				color: null
+			}
+		];
+		setupVideoOverlayFixture([clip], { cursorPosition: 500 });
+
+		const component = render(VideoOverlay);
+		await settleOverlay();
+
+		const translationNode = getForegroundTranslationNode(component.container, 'english');
+		expect(translationNode).not.toBeNull();
+		const boldSpan = translationNode!.querySelector('span[style*="font-weight: 700"]');
+		expect(boldSpan).not.toBeNull();
+	});
+
+	test('renders translation with color inline style', async () => {
+		const clip = new SubtitleClip(0, 999, 1, 1, 0, 1, 'Arabic', [], false, false, {
+			english: new VerseTranslation('Colored word', 'reviewed')
+		});
+		const verseTrans = clip.translations['english'] as VerseTranslation;
+		verseTrans.inlineStyleRuns = [
+			{
+				startWordIndex: 0,
+				endWordIndex: 0,
+				bold: false,
+				italic: false,
+				underline: false,
+				color: '#FF0000'
+			}
+		];
+		setupVideoOverlayFixture([clip], { cursorPosition: 500 });
+
+		const component = render(VideoOverlay);
+		await settleOverlay();
+
+		const translationNode = getForegroundTranslationNode(component.container, 'english');
+		expect(translationNode).not.toBeNull();
+		expect(translationNode!.innerHTML).toContain('color: rgb(255, 0, 0)');
+	});
+});

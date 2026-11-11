@@ -1,0 +1,511 @@
+import { getCurrentWindow } from '@tauri-apps/api/window';
+import {
+	AssetClip,
+	ClipWithTranslation,
+	PredefinedSubtitleClip,
+	SilenceClip,
+	SubtitleClip
+} from './Clip.svelte';
+import { ProjectEditorTabs } from './enums';
+import { SerializableBase } from './misc/SerializableBase';
+import { globalState } from '$lib/runes/main.svelte';
+import ModalManager from '$lib/components/modals/ModalManager';
+import LL from '$lib/i18n/i18n-svelte';
+import { get } from 'svelte/store';
+import type { StoredSegmentationContext } from '$lib/services/AutoSegmentation';
+import type { MeaningExportRange } from '$lib/services/MeaningExportRangeService';
+
+/**
+ * État de l'éditeur de projet, utilisé pour gérer l'interface utilisateur et les interactions
+ * dans l'éditeur de projet.
+ */
+export class ProjectEditorState extends SerializableBase {
+	// L'onglet actuellement sélectionné dans l'éditeur de projet
+	currentTab: ProjectEditorTabs = $state(ProjectEditorTabs.VideoEditor);
+
+	// Indique si on montre ou non l'indication "Drop your files here"
+	showDropScreen: boolean = $state(false);
+
+	// Indique si l'utilisateur a déjà répondu à la proposition d'adapter les dimensions au média.
+	hasAnsweredVideoDimensionPrompt: boolean = $state(false);
+
+	// Indique si le guide progressif de l'éditeur a été masqué pour ce projet.
+	onboardingGuideDismissed: boolean = $state(false);
+	// Indique si l'aide contextuelle des traductions a été masquée pour ce projet.
+	translationGuideDismissed: boolean = $state(false);
+	// Indique si l'aide contextuelle des styles a été masquée pour ce projet.
+	styleGuideDismissed: boolean = $state(false);
+	// Indique si la note sur l'interpolation des images clés a déjà été affichée.
+	keyframeInterpolationNoticeShown: boolean = $state(false);
+
+	// Indique quelle(s) section(s) de l'éditeur sont étendues
+	sections: {
+		[name: string]: {
+			extended: boolean;
+		};
+	} = $state({});
+
+	// Timeline
+	timeline: TimelineState = $state(new TimelineState());
+
+	// Video preview
+	videoPreview: VideoPreviewState = $state(new VideoPreviewState());
+
+	// Subtitles editor
+	subtitlesEditor: SubtitlesEditorState = $state(new SubtitlesEditorState());
+
+	// Translations editor
+	translationsEditor: TranslationsEditorState = $state(new TranslationsEditorState());
+
+	// Styles editor
+	stylesEditor: StylesEditorState = $state(new StylesEditorState());
+
+	// Export
+	export: ExportState = $state(new ExportState());
+}
+
+export class StylesEditorState extends SerializableBase {
+	// Indique la position du scroll dans l'éditeur de styles
+	scrollPosition: number = $state(0);
+
+	// Indique quel est la sélection actuelle dans l'éditeur de styles (global/arabic/translation)
+	currentSelection: 'global' | 'arabic' | 'translation' = $state('global');
+
+	// Indique quelle traduction est actuellement sélectionnée dans l'éditeur de styles
+	currentSelectionTranslation: string = $state('');
+
+	// Indique la requête de recherche actuelle dans l'éditeur de styles
+	searchQuery: string = $state('');
+
+	// Indique le panneau actuellement affiché dans l'éditeur de styles
+	currentPanel: string = $state('');
+
+	// Indique la catégorie active dans chaque panneau de l'éditeur de styles
+	activePanelCategoryIds: Record<string, string> = $state({});
+
+	// Preset local appliqué à ce projet, conservé lors des changements d'onglet.
+	activeLocalPresetId: number | null = $state(null);
+
+	// Indique les sous-titres actuellement sélectionnés dans l'éditeur de styles
+	selectedSubtitles: Array<SubtitleClip | PredefinedSubtitleClip> = $state([]);
+
+	// Indique les clips vidéo actuellement sélectionnés dans l'éditeur de styles
+	selectedVideos: Array<AssetClip> = $state([]);
+
+	// Indique la catégorie sur laquelle on doit scroll et highlight quelque seconde
+	scrollAndHighlight: string | null = $state(null);
+
+	getCurrentSelection(): 'global' | 'arabic' | string {
+		if (this.currentSelection === 'global' || this.currentSelection === 'arabic') {
+			return this.currentSelection;
+		}
+		return this.currentSelectionTranslation;
+	}
+
+	isSelected(id: number) {
+		return this.selectedSubtitles.some((subtitle) => subtitle.id === id);
+	}
+
+	isSelectedVideo(id: number) {
+		return this.selectedVideos.some((clip) => clip.id === id);
+	}
+
+	/**
+	 * Retourne l'unite de selection reelle d'un sous-titre.
+	 * Un clip merge visuellement selectionne toujours tout son groupe.
+	 *
+	 * @param {SubtitleClip | PredefinedSubtitleClip} clip Clip a expandre.
+	 * @returns {Array<SubtitleClip | PredefinedSubtitleClip>} Clips a selectionner ensemble.
+	 */
+	getSelectionUnitForSubtitle(
+		clip: SubtitleClip | PredefinedSubtitleClip
+	): Array<SubtitleClip | PredefinedSubtitleClip> {
+		if (clip instanceof SubtitleClip && globalState.currentProject) {
+			const mergeGroup = globalState.getSubtitleTrack.getVisualMergeGroupForClipId(clip.id);
+			if (mergeGroup) return mergeGroup.clips;
+		}
+
+		return [clip];
+	}
+
+	/**
+	 * Normalise une selection de sous-titres pour garantir qu'aucun groupe merge
+	 * n'est present partiellement, puis la retrie selon l'ordre de la timeline.
+	 *
+	 * @param {Array<SubtitleClip | PredefinedSubtitleClip>} selection Selection brute.
+	 * @returns {Array<SubtitleClip | PredefinedSubtitleClip>} Selection normalisee.
+	 */
+	normalizeSubtitleSelection(
+		selection: Array<SubtitleClip | PredefinedSubtitleClip>
+	): Array<SubtitleClip | PredefinedSubtitleClip> {
+		const expandedSelection = selection.flatMap((clip) => this.getSelectionUnitForSubtitle(clip));
+		const uniqueSelection = Array.from(
+			new Map(expandedSelection.map((clip) => [clip.id, clip])).values()
+		);
+
+		if (!globalState.currentProject) return uniqueSelection;
+
+		return uniqueSelection.sort((firstClip, secondClip) => {
+			return (
+				globalState.getSubtitleTrack.clips.findIndex((trackClip) => trackClip.id === firstClip.id) -
+				globalState.getSubtitleTrack.clips.findIndex((trackClip) => trackClip.id === secondClip.id)
+			);
+		});
+	}
+
+	toggleSelection(clip: SubtitleClip | PredefinedSubtitleClip) {
+		if (!(clip instanceof SubtitleClip || clip instanceof PredefinedSubtitleClip)) return;
+		// Les selections sous-titres/videos sont mutuellement exclusives.
+		this.selectedVideos = [];
+
+		const selectionUnit = this.getSelectionUnitForSubtitle(clip);
+		const selectionUnitIds = new Set(selectionUnit.map((subtitle) => subtitle.id));
+		const isWholeUnitAlreadySelected = selectionUnit.every((subtitle) =>
+			this.isSelected(subtitle.id)
+		);
+
+		if (isWholeUnitAlreadySelected) {
+			this.selectedSubtitles = this.selectedSubtitles.filter(
+				(subtitle) => !selectionUnitIds.has(subtitle.id)
+			);
+		} else {
+			this.selectedSubtitles = this.normalizeSubtitleSelection([
+				...this.selectedSubtitles,
+				...selectionUnit
+			]);
+		}
+	}
+
+	selectOnly(clip: SubtitleClip | PredefinedSubtitleClip) {
+		if (!(clip instanceof SubtitleClip || clip instanceof PredefinedSubtitleClip)) return;
+		// Les selections sous-titres/videos sont mutuellement exclusives.
+		this.selectedVideos = [];
+		this.selectedSubtitles = this.normalizeSubtitleSelection([clip]);
+	}
+
+	removeSelection(id: number) {
+		const clipToRemove = globalState.currentProject
+			? globalState.getSubtitleTrack.clips.find((clip) => clip.id === id)
+			: null;
+
+		if (clipToRemove instanceof SubtitleClip || clipToRemove instanceof PredefinedSubtitleClip) {
+			const selectionUnitIds = new Set(
+				this.getSelectionUnitForSubtitle(clipToRemove).map((subtitle) => subtitle.id)
+			);
+			this.selectedSubtitles = this.selectedSubtitles.filter(
+				(subtitle) => !selectionUnitIds.has(subtitle.id)
+			);
+			return;
+		}
+
+		this.selectedSubtitles = this.selectedSubtitles.filter((subtitle) => subtitle.id !== id);
+	}
+
+	toggleVideoSelection(clip: AssetClip) {
+		if (!(clip instanceof AssetClip)) return;
+		// Les sélections sous-titres/vidéos sont mutuellement exclusives.
+		this.selectedSubtitles = [];
+
+		if (this.isSelectedVideo(clip.id)) {
+			this.selectedVideos = this.selectedVideos.filter((videoClip) => videoClip.id !== clip.id);
+		} else {
+			this.selectedVideos.push(clip);
+		}
+	}
+
+	selectOnlyVideo(clip: AssetClip) {
+		if (!(clip instanceof AssetClip)) return;
+		// Les sélections sous-titres/vidéos sont mutuellement exclusives.
+		this.selectedSubtitles = [];
+		this.selectedVideos = [clip];
+	}
+
+	removeVideoSelection(id: number) {
+		this.selectedVideos = this.selectedVideos.filter((videoClip) => videoClip.id !== id);
+	}
+
+	clearSelection() {
+		globalState.getSubtitlesEditorState.editSubtitle = null;
+		this.selectedSubtitles = [];
+		this.selectedVideos = [];
+	}
+
+	selectAllSubtitles() {
+		this.selectedVideos = [];
+		this.selectedSubtitles = globalState.getSubtitleTrack.clips.filter(
+			(clip): clip is SubtitleClip | PredefinedSubtitleClip =>
+				clip instanceof SubtitleClip || clip instanceof PredefinedSubtitleClip
+		);
+	}
+}
+
+/**
+ * État de la timeline dans l'éditeur de projet.
+ */
+export class TimelineState extends SerializableBase {
+	// Niveau de zoom de la timeline
+	zoom: number = $state(29.25);
+
+	// Position du curseur dans la timeline
+	cursorPosition: number = $state(1);
+
+	// Indique si on doit afficher ou non le curseur de la timeline
+	showCursor: boolean = $state(true);
+
+	// State permettant de trigger le changement du temps de la vidéo et de l'audio dans la preview
+	movePreviewTo: number = $state(0);
+
+	// Token non temporel pour forcer un rafraîchissement de la preview sans bouger le curseur
+	previewRefreshToken: number = $state(0);
+
+	// Position du scroll
+	scrollX: number = $state(0);
+
+	// Indique si le curseur a été déplacé par un drag (pour éviter la sélection de clip au mouseup)
+	wasCursorDragged: boolean = $state(false);
+}
+
+/**
+ * État de la prévisualisation vidéo dans l'éditeur de projet.
+ */
+export class VideoPreviewState extends SerializableBase {
+	// Indique si la prévisualisation vidéo est en pause
+	isPlaying: boolean = $state(false);
+
+	// Vitesse de lecture globale de la prévisualisation
+	playbackSpeed: number = $state(1.0);
+
+	// Indique si la prévisualisation vidéo est en plein écran
+	isFullscreen: boolean = $state(false);
+
+	// Indique si la grille d'alignement doit être affichée dans l'onglet Style
+	showAlignmentGrid: boolean = $state(false);
+
+	// Indique si la maquette TikTok doit être affichée dans la preview portrait
+	showTikTokOverlay: boolean = $state(false);
+
+	// Affiche temporairement la grille pendant un drag d'élément dans la preview
+	showAlignmentGridWhileDragging: boolean = $state(false);
+
+	// Indique si on doit mute la vidéo
+	showVideosAndAudios: boolean = $state(false);
+
+	// Fonction pour toggle play/pause, sera définie par le composant VideoPreview
+	togglePlayPause: () => void = () => {};
+
+	// Fonction pour scroll la timeline à la position du curseur, sera définie par le composant Timeline
+	scrollTimelineToCursor: () => void = () => {};
+
+	async toggleFullScreen() {
+		const appWindow = getCurrentWindow();
+
+		try {
+			globalState.currentProject!.projectEditorState.videoPreview.isFullscreen =
+				!globalState.currentProject!.projectEditorState.videoPreview.isFullscreen;
+			await appWindow.setFullscreen(
+				globalState.currentProject!.projectEditorState.videoPreview.isFullscreen
+			);
+		} catch (err: unknown) {
+			ModalManager.errorModal(
+				get(LL).common.error(),
+				get(LL).common.unexpectedError(),
+				JSON.stringify(err)
+			);
+		}
+	}
+}
+
+export class SubtitlesEditorState extends SerializableBase {
+	// Indique la sourate actuellement sélectionnée dans l'éditeur de sous-titres
+	selectedSurah: number = $state(1);
+
+	// Indique le numéro du verset actuellement sélectionné dans l'éditeur de sous-titres
+	selectedVerse: number = $state(1);
+
+	// Indique l'index du premier mot actuellement sélectionné dans l'éditeur de sous-titres
+	startWordIndex: number = $state(0);
+
+	// Indique l'index du dernier mot actuellement sélectionné dans l'éditeur de sous-titres
+	endWordIndex: number = $state(0);
+
+	// Playback speed
+	playbackSpeed: number = $state(1.0);
+
+	// Playback speed dédiée au mode WBW
+	wbwPlaybackSpeed: number = $state(0.75);
+
+	// Affiche la traduction des mots
+	showWordTranslation: boolean = $state(true);
+
+	// Affiche la translittération des mots
+	showWordTransliteration: boolean = $state(false);
+
+	// Indique le sous-titre à éditer dans l'éditeur de sous-titres (null si aucun)
+	editSubtitle: SubtitleClip | PredefinedSubtitleClip | ClipWithTranslation | SilenceClip | null =
+		$state(null);
+
+	// Si défini, passe automatiquement au clip suivant après la prochaine validation d'édition.
+	pendingSplitEditNextId: number | null = $state(null);
+
+	// Nombre initial de segments à review (set lors de l'auto-segmentation)
+	// Utilisé pour afficher la barre de progression des segments à review
+	initialLowConfidenceCount: number = $state(0);
+
+	// Filtre par nombre de mots minimum dans la liste des sous-titres
+	minWordCount: number = $state(0);
+
+	// Seuil utilisé pour marquer les segments trop longs.
+	longSegmentMinWords: number = $state(12);
+	longSegmentMaxWords: number = $state(999);
+
+	// Contexte courant permettant de rejouer des réajustements depuis la segmentation.
+	segmentationContext: StoredSegmentationContext = $state({
+		audioId: null,
+		source: null,
+		effectiveMode: null,
+		modelName: null,
+		device: null,
+		riwayah: null,
+		includeWbwTimestamps: true,
+		alignedSegments: []
+	});
+
+	// Paramètres du panneau de subdivision des segments longs.
+	subdivideMaxVersesPerSegment: number = $state(1);
+	subdivideMaxWordsPerSegment: number = $state(30);
+	subdivideMaxDurationPerSegment: number = $state(30);
+	subdivideOnlySplitAtStopSigns: boolean = $state(true);
+	aiSemanticSplitMaxWords: number = $state(10);
+}
+
+export class TranslationsEditorState extends SerializableBase {
+	// Indique la position du scroll dans l'éditeur de traductions
+	scrollPosition: number = $state(0);
+
+	// Indique si le mode de style en ligne est activé et quels styles sont activés
+	isInlineStyleMode: boolean = $state(false);
+	isTranslationWbwMappingMode: boolean = $state(false);
+	translationWbwActiveArabicWordIndex: number = $state(0);
+	inlineStyleBoldEnabled: boolean = $state(false);
+	inlineStyleItalicEnabled: boolean = $state(false);
+	inlineStyleUnderlineEnabled: boolean = $state(false);
+	inlineStyleLineBreakEnabled: boolean = $state(false);
+	inlineStyleColorEnabled: boolean = $state(false);
+	inlineStyleColorValue: string = $state('#f59e0b');
+	inlineStyleGlowEnabled: boolean = $state(false);
+	inlineStyleGlowColorValue: string = $state('#ffffff');
+
+	// Paramètres persistants du workflow AI Bold
+	aiBoldCustomNote: string = $state('');
+	aiBoldStartTimeMs: number = $state(0);
+	aiBoldEndTimeMs: number = $state(0);
+	aiBoldIncludeAlreadyBolded: boolean = $state(true);
+	aiBoldEditionName: string = $state('');
+	aiWbwTranslationStartTimeMs: number = $state(0);
+	aiWbwTranslationEndTimeMs: number = $state(0);
+	aiWbwTranslationEditionName: string = $state('');
+
+	// Dernier sous-titre lu dans l'éditeur de traductions pour reprendre là où on s'est arrêté
+	lastReadClipId: number | null = $state(null);
+	lastReadUpdatedAt: string | null = $state(null);
+
+	// Indique le filtre actuellement appliqué dans l'éditeur de traductions
+	filters: { [statut: string]: boolean } = $state({
+		'to review': true,
+		'ai error': true,
+		error: true,
+		'ai trimmed': true,
+		'automatically trimmed': true,
+		fetched: false,
+		reviewed: true,
+		'completed by default': false
+	});
+
+	searchQuery: string = $state('');
+	onlyShowOverlappingSubtitles: boolean = $state(false);
+
+	checkOnlyFilters(list: string[]) {
+		for (const key of list) {
+			if (!(key in this.filters)) this.filters[key] = false;
+		}
+		for (const key in this.filters) {
+			if (list.includes(key)) {
+				this.filters[key] = true;
+			} else {
+				this.filters[key] = false;
+			}
+		}
+	}
+}
+
+export const DEFAULT_RECITATION_CUT_MARGIN_MS = 350;
+export const DEFAULT_RECITATION_MINIMUM_SILENCE_MS = 3000;
+
+export interface ExportSkipRange {
+	startTime: number;
+	endTime: number;
+}
+
+export class ExportState extends SerializableBase {
+	// Ces anciennes options de projet sont désormais des réglages globaux.
+	static override __ignoredProperties = [
+		'includeQuranCaptionPromotion',
+		'quranCaptionPromotionPosition'
+	] as const;
+
+	// Indique le type d'export choisie
+	selectedChoice: 'video' | 'subtitles' | 'chapters' | 'project' | 'thumbnail' | 'images' =
+		$state('video');
+
+	/*
+	 * ============================================
+	 * SUBTITLES EXPORT STATES
+	 * ============================================
+	 */
+
+	// Le format de sous-titre choisi
+	subtitleFormat: 'SRT' | 'VTT' = $state('SRT');
+
+	// Indique les cibles incluses dans l'export
+	includedTarget: { [target: string]: boolean } = $state({});
+
+	// Indique si on exporte les numéros de verset ou pas
+	exportVerseNumbers: { [target: string]: boolean } = $state({});
+
+	// Indique le format du texte arabe
+	arabicTextFormat: 'Plain' | 'V1' | 'V2' = $state('Plain');
+
+	// Indique la sélection d'exportation des chapitres YouTube
+	ytbChaptersChoice: 'Each Surah' | 'Each Verse' | 'Each Hizb' | 'Each Juz' | 'Each Rub' =
+		$state('Each Surah');
+	ytbChaptersFormat: string = $state('<timestamp> Surah <surah-number>, Verse <verse-number>');
+	ytbChaptersTranslationEditionName: string = $state('');
+
+	// Indique la partie de la vidéo à exporter
+	exportRangeMode: 'time' | 'verse' | 'meaning' = $state('time');
+	meaningMaxDurationSeconds: number = $state(60);
+	includeAllMeaningVerses: boolean = $state(false);
+	meaningRanges: MeaningExportRange[] = $state([]);
+	videoStartTime: number = $state(0);
+	videoEndTime: number = $state(0);
+	skipRanges: ExportSkipRange[] = $state([]);
+	fps: number = $state(30);
+	exportOnlyRecitation: boolean = $state(false);
+	recitationCutMarginMs: number = $state(DEFAULT_RECITATION_CUT_MARGIN_MS);
+	recitationMinimumSilenceMs: number = $state(DEFAULT_RECITATION_MINIMUM_SILENCE_MS);
+	exportWithoutBackground: boolean = $state(false);
+	addRandomBackground: boolean = $state(false);
+	transparentExportFormat: 'mov_prores_4444' | 'webm_vp9_alpha' = $state('mov_prores_4444');
+	customFileName: string = $state('');
+}
+
+SerializableBase.registerChildClass(ProjectEditorState, 'timeline', TimelineState);
+SerializableBase.registerChildClass(
+	ProjectEditorState,
+	'translationsEditor',
+	TranslationsEditorState
+);
+SerializableBase.registerChildClass(ProjectEditorState, 'videoPreview', VideoPreviewState);
+SerializableBase.registerChildClass(ProjectEditorState, 'subtitlesEditor', SubtitlesEditorState);
+SerializableBase.registerChildClass(ProjectEditorState, 'stylesEditor', StylesEditorState);
+SerializableBase.registerChildClass(ProjectEditorState, 'export', ExportState);

@@ -1,0 +1,1000 @@
+import { Project, ProjectContent, ProjectDetail, Utilities, VideoStyle } from '$lib/classes';
+import { ClipWithTranslation, CustomImageClip } from '$lib/classes/Clip.svelte';
+import { readDir, remove, writeTextFile, readTextFile, exists, mkdir } from '@tauri-apps/plugin-fs';
+import { appDataDir, join } from '@tauri-apps/api/path';
+import { invoke } from '@tauri-apps/api/core';
+import { globalState } from '$lib/runes/main.svelte';
+import { projectJsonReferencesQuaCache, pruneOrphanedQuaCache } from '$lib/services/QuaAudioCache';
+import QPCFontProvider from '$lib/services/FontProvider';
+import type { ImportedProjectPayload } from '$lib/types/project';
+import { DEFAULT_PROJECT_TYPE, type ProjectType } from '$lib/types/projectType';
+import LL from '$lib/i18n/i18n-svelte';
+import { get } from 'svelte/store';
+import toast from 'svelte-5-french-toast';
+import { ProjectHistoryManager } from '$lib/services/undoRedo/ProjectHistoryManager';
+import { applySubtitleCreationLayout } from '$lib/classes/videoStyles/VideoStyleFactory';
+
+export type ProjectVideoFormat = 'landscape' | 'portrait' | 'square';
+export type ProjectVideoQuality = '720p' | '1080p' | '1440p' | '2160p';
+
+/**
+ * Résout les dimensions d'un format et d'une qualité vidéo prédéfinis.
+ * @param {ProjectVideoFormat} format Format paysage, portrait ou carré.
+ * @param {ProjectVideoQuality} quality Qualité vidéo sélectionnée.
+ * @returns {{ width: number; height: number }} Dimensions correspondantes.
+ */
+export function getProjectVideoDimensions(
+	format: ProjectVideoFormat,
+	quality: ProjectVideoQuality
+): { width: number; height: number } {
+	const [width, height] = {
+		'720p': [1280, 720],
+		'1080p': [1920, 1080],
+		'1440p': [2560, 1440],
+		'2160p': [3840, 2160]
+	}[quality];
+	if (format === 'portrait') return { width: height, height: width };
+	if (format === 'square') return { width: height, height };
+	return { width, height };
+}
+
+export interface CreateEmptyProjectOptions {
+	name: string;
+	reciter: string;
+	projectType?: ProjectType;
+	batchId?: number | null;
+	batchOrder?: number | null;
+	videoDimensions?: { width: number; height: number };
+}
+
+/**
+ * Applique les dimensions choisies et le preset texte adapté à l'orientation d'un nouveau projet.
+ * @param {ProjectContent} content Contenu initial du projet.
+ * @param {{ width: number; height: number }} videoDimensions Dimensions vidéo sélectionnées.
+ * @returns {void}
+ */
+export function applyProjectCreationPreset(
+	content: ProjectContent,
+	videoDimensions: { width: number; height: number }
+): void {
+	ProjectHistoryManager.track('apply project creation preset', () => {
+		const dimensionStyle = content.videoStyle
+			.getStylesOfTarget('global')
+			.findStyle('video-dimension');
+		if (dimensionStyle) dimensionStyle.value = videoDimensions;
+		const antiCollision = content.videoStyle
+			.getStylesOfTarget('global')
+			.findStyle('anti-collision');
+		if (antiCollision) antiCollision.value = false;
+		const portrait = videoDimensions.width < videoDimensions.height;
+		for (const styles of content.videoStyle.styles) {
+			if (styles.target === 'arabic') applySubtitleCreationLayout(styles, 'arabic', portrait);
+			else if (styles.target !== 'global')
+				applySubtitleCreationLayout(styles, 'translation', portrait);
+		}
+	});
+}
+
+export interface ParsedProjectsBackup {
+	projects: ImportedProjectPayload[];
+	batches: Record<string, unknown>[];
+}
+
+interface ProjectPackageAssetDescriptor {
+	id: number;
+	sourcePath: string;
+	fileName: string;
+}
+
+interface ProjectPackageAsset {
+	id: number;
+	fileName: string;
+	size: number;
+}
+
+interface ProjectPackageCustomImageDescriptor {
+	clipId: number;
+	sourcePath: string;
+	fileName: string;
+}
+
+interface ProjectPackageCustomImage {
+	clipId: number;
+	fileName: string;
+	size: number;
+}
+
+interface ProjectPackageLinkedImageDescriptor {
+	kind: 'subtitle' | 'style';
+	clipId?: number;
+	styleId?: string;
+	sourcePath: string;
+	fileName: string;
+}
+
+interface ProjectPackageLinkedImage {
+	kind: 'subtitle' | 'style';
+	clipId?: number;
+	styleId?: string;
+	fileName: string;
+	size: number;
+}
+
+interface ProjectPackageFontDescriptor {
+	family: string;
+	sourcePath: string;
+	fileName: string;
+}
+
+interface ProjectPackageFont {
+	family: string;
+	fileName: string;
+	size: number;
+}
+
+interface ProjectPackageManifest {
+	version: number;
+	project: ImportedProjectPayload;
+	assets: ProjectPackageAsset[];
+	customImages?: ProjectPackageCustomImage[];
+	linkedImages?: ProjectPackageLinkedImage[];
+	fonts?: ProjectPackageFont[];
+}
+
+/**
+ * Accepte le format historique sous forme de tableau et le format versionné avec batches.
+ * @param {unknown} payload Contenu JSON brut de la sauvegarde.
+ * @returns {ParsedProjectsBackup} Collections de projets et de batches à importer.
+ */
+export function parseProjectsBackup(payload: unknown): ParsedProjectsBackup {
+	if (Array.isArray(payload)) return { projects: payload as ImportedProjectPayload[], batches: [] };
+	if (!payload || typeof payload !== 'object') throw new Error('Invalid backup file.');
+	const backup = payload as Record<string, unknown>;
+	if (backup.version !== 2 || !Array.isArray(backup.projects) || !Array.isArray(backup.batches))
+		throw new Error('Unsupported backup format.');
+	return {
+		projects: backup.projects as ImportedProjectPayload[],
+		batches: backup.batches as Record<string, unknown>[]
+	};
+}
+
+/**
+ * Service pour gérer les projets.
+ * Utilise JSONProjectStorage pour la persistance des données.
+ */
+export class ProjectService {
+	private static projectsFolder: string = 'projects/';
+	private static assetsFolder: string = 'assets/';
+	private static detailsLoadConcurrency = 16;
+
+	private static async mapWithConcurrency<T, R>(
+		items: T[],
+		concurrency: number,
+		mapper: (item: T, index: number) => Promise<R>
+	): Promise<R[]> {
+		if (items.length === 0) return [];
+
+		// Préserve l'ordre final des résultats même si le traitement est parallèle.
+		const results: R[] = new Array(items.length);
+		let cursor = 0;
+		const workerCount = Math.min(concurrency, items.length);
+
+		// Pool de workers asynchrones avec concurrence bornée.
+		const workers = Array.from({ length: workerCount }, async () => {
+			while (true) {
+				const index = cursor++;
+				if (index >= items.length) break;
+				results[index] = await mapper(items[index], index);
+			}
+		});
+
+		await Promise.all(workers);
+		return results;
+	}
+
+	/**
+	 * Lit les détails d'un projet à partir d'un fichier.
+	 * @param projectsPath Le chemin vers le dossier des projets
+	 * @param fileName Le nom du fichier à lire
+	 * @returns Les détails du projet ou null si le fichier n'existe pas
+	 */
+	private static async readProjectDetailFromFile(
+		projectsPath: string,
+		fileName: string
+	): Promise<ProjectDetail | null> {
+		// Extraction de l'ID du nom de fichier (ex: "123.json" -> 123)
+		const projectId = parseInt(fileName.replace('.json', ''), 10);
+		if (isNaN(projectId)) return null;
+
+		try {
+			const filePath = await join(projectsPath, fileName);
+			const fileContent = await readTextFile(filePath);
+			const projectData = JSON.parse(fileContent);
+			if (!projectData?.detail) {
+				throw new Error('Missing detail object in project file');
+			}
+			// Charge uniquement les détails du projet pour accélérer la homepage.
+			return ProjectDetail.fromJSON(projectData.detail) as ProjectDetail;
+		} catch (error) {
+			console.warn(`Impossible de charger le projet ${projectId}:`, error);
+			toast.error(`${get(LL).home.projectFileInvalid()} (${fileName})`);
+			return null;
+		}
+	}
+
+	/**
+	 * S'assure que le dossier des projets existe
+	 */
+	static async ensureFolder(folder: string): Promise<string> {
+		const folderPath = await join(await appDataDir(), folder);
+		if (!(await exists(folderPath))) {
+			await mkdir(folderPath, { recursive: true });
+		}
+		return folderPath;
+	}
+
+	static async getProjectsFolderPath(): Promise<string> {
+		return this.ensureFolder(this.projectsFolder);
+	}
+
+	/**
+	 * Crée et sauvegarde un projet vide sans l'ouvrir.
+	 * @param {CreateEmptyProjectOptions} options Métadonnées du nouveau projet.
+	 * @returns {Promise<Project>} Projet créé et sauvegardé.
+	 */
+	static async createEmptyProject(options: CreateEmptyProjectOptions): Promise<Project> {
+		const project = new Project(
+			new ProjectDetail(
+				options.name.trim(),
+				options.reciter.trim(),
+				undefined,
+				undefined,
+				options.projectType ?? DEFAULT_PROJECT_TYPE,
+				options.batchId ?? null,
+				options.batchOrder ?? null
+			),
+			await ProjectContent.getDefaultProjectContent()
+		);
+		applyProjectCreationPreset(
+			project.content,
+			options.videoDimensions ?? { width: 1920, height: 1080 }
+		);
+		const projectsPath = await this.ensureFolder(this.projectsFolder);
+		while (await exists(await join(projectsPath, `${project.detail.id}.json`))) {
+			project.detail.id = Utilities.randomId();
+		}
+
+		await project.save();
+		return project;
+	}
+
+	/**
+	 * Sauvegarde un projet sur l'ordinateur
+	 * @param project Le projet à sauver
+	 */
+	static async save(project: Project) {
+		// S'assure que le dossier existe
+		const projectsPath = await this.ensureFolder(this.projectsFolder);
+
+		// Construis le chemin d'accès vers le projet
+		const filePath = await join(projectsPath, `${project.detail.id}.json`);
+
+		await writeTextFile(filePath, JSON.stringify(project.toJSON(), null, 2));
+	}
+
+	/**
+	 * Sauvegarde les détails d'un projet.
+	 * @param detail Les détails du projet à sauvegarder
+	 */
+	static async saveDetail(detail: ProjectDetail, updateUpdateAt: boolean = true): Promise<void> {
+		// Récupère le projet complet
+		const project = await this.load(detail.id);
+
+		// Met à jour les détails du projet
+		project.detail = detail;
+
+		// Sauvegarde le projet complet
+		await project.save(updateUpdateAt);
+	}
+
+	/**
+	 * Charge un projet complet depuis le stockage.
+	 * @param projectId L'id du projet
+	 * @param onlyDetail Si true, ne charge que les détails du projet
+	 * @returns Le projet
+	 */
+	static async load(
+		projectId: number,
+		onlyDetail: boolean = false,
+		customFolder?: string
+	): Promise<Project> {
+		const folder = customFolder || this.projectsFolder;
+
+		// S'assure que le dossier existe
+		const projectsPath = await this.ensureFolder(folder);
+
+		// Construis le chemin d'accès vers le projet
+		const filePath = await join(projectsPath, `${projectId}.json`);
+
+		// Vérifie que le fichier existe
+		if (!(await exists(filePath))) {
+			throw new Error(`Project with ID ${projectId} not found.`);
+		}
+
+		// Lit le fichier JSON
+		const fileContent = await readTextFile(filePath);
+		const projectData = JSON.parse(fileContent);
+
+		if (onlyDetail) {
+			// Évite de charger le contenu du projet si on ne veut que les détails
+			return new Project(ProjectDetail.fromJSON(projectData.detail) as ProjectDetail);
+		}
+
+		// Utilise la méthode fromJSON automatique pour récupérer l'instance correcte
+		const project = Project.fromJSON(projectData) as Project;
+
+		// Si le projet ne contient pas de styles vidéo, on initialise avec un style par défaut
+		// || true
+		if (Object.keys(project.content.videoStyle.styles).length === 0) {
+			// Si les styles ne sont pas définis, on initialise avec un style par défaut
+			project.content.videoStyle = await VideoStyle.getDefaultVideoStyle();
+		}
+
+		return project;
+	}
+
+	/**
+	 * Supprime un projet de l'ordinateur.
+	 * @param projectId L'id du projet à supprimer
+	 * @param options `sweepQuaCache` (défaut true) : après suppression, purge les
+	 *   fichiers du cache audio QUA que plus aucun projet ne référence. Les chemins
+	 *   de suppression en lot (BatchService) passent false et purgent une seule fois
+	 *   à la fin pour éviter une course + un rechargement O(n²) des JSON de projet.
+	 */
+	static async delete(projectId: number, options: { sweepQuaCache?: boolean } = {}): Promise<void> {
+		const projectsPath = await join(await appDataDir(), this.projectsFolder);
+
+		// Détecte AVANT suppression si ce projet référençait le cache QUA : la purge
+		// (coûteuse, scanne tous les projets) ne se déclenche que dans ce cas.
+		let referencedQuaCache = false;
+
+		try {
+			// Construis le chemin d'accès vers le projet
+			const filePath = await join(projectsPath, `${projectId}.json`);
+			try {
+				referencedQuaCache = projectJsonReferencesQuaCache(await readTextFile(filePath));
+			} catch {
+				// JSON illisible/déjà absent : rien à purger pour ce projet.
+			}
+			await remove(filePath);
+
+			// Supprime le dossier des assets associés au projet
+			const assetsPath = await this.getAssetFolderForProject(projectId);
+			await remove(assetsPath, { recursive: true });
+		} catch (_e) {
+			// Le projet n'avait pas d'asset
+		}
+
+		// Purge « eager » du cache partagé : l'audio QUA vit hors du dossier par
+		// projet, donc le remove ci-dessus ne le touche pas. On supprime ici tout
+		// fichier de cache devenu orphelin (plus référencé par aucun projet).
+		if ((options.sweepQuaCache ?? true) && referencedQuaCache) {
+			await pruneOrphanedQuaCache();
+		}
+
+		// Le supprime de la liste des projets
+		setTimeout(() => {
+			globalState.userProjectsDetails = globalState.userProjectsDetails.filter(
+				(p) => p.id !== projectId
+			);
+		}, 0);
+	}
+
+	/**
+	 * Récupère tous les détails des projets existants.
+	 * Met à jour la liste des projets de l'utilisateur dans le globalState.
+	 */
+	static async loadUserProjectsDetails() {
+		try {
+			// Récupère le chemin absolu vers le dossier contenant les projets
+			const projectsPath = await join(await appDataDir(), this.projectsFolder);
+
+			// Vérifie que le dossier existe
+			if (!(await exists(projectsPath))) {
+				// Si le dossier n'existe pas, c'est que l'utilisateur n'a
+				// pas encore créer de projet
+				return [];
+			}
+
+			// Récupère tout les fichiers projets
+			const entries = await readDir(projectsPath);
+			const projectFiles = entries
+				// Conserve uniquement les fichiers JSON de projet.
+				.filter((entry) => entry.isFile && !!entry.name && entry.name.endsWith('.json'))
+				.map((entry) => entry.name as string);
+
+			// Charge les détails en parallèle (au lieu d'un await séquentiel par fichier).
+			const loaded = await this.mapWithConcurrency(
+				projectFiles,
+				this.detailsLoadConcurrency,
+				(fileName) => this.readProjectDetailFromFile(projectsPath, fileName)
+			);
+			// Ignore les fichiers invalides/corrompus tout en gardant les projets valides.
+			const projects = loaded.filter((project): project is ProjectDetail => project !== null);
+
+			// Trie les projets par date de création décroissante
+			projects.sort((a, b) => b.updatedAt.getTime() - a.updatedAt.getTime());
+
+			globalState.userProjectsDetails = projects;
+		} catch (_error) {
+			return [];
+		}
+	}
+
+	/**
+	 * Récupère le chemin du dossier des assets téléchargés.
+	 * @returns Le chemin du dossier des assets
+	 */
+	static async getAssetFolderForProject(projectId: number): Promise<string> {
+		return await join(await appDataDir(), this.assetsFolder, projectId.toString());
+	}
+
+	/**
+	 * Duplicate a project completely (JSON files and asset folder) with a new ID.
+	 * @param projectId The ID of the project to duplicate
+	 * @returns The exact duplicated project instance
+	 */
+	static async duplicate(projectId: number): Promise<Project> {
+		// Load the full project
+		const project = await this.load(projectId);
+
+		// Clone JSON
+		const duplicatedJson = JSON.parse(JSON.stringify(project.toJSON()));
+
+		// Set new identifiers and details
+		const newId = Utilities.randomId();
+		duplicatedJson.detail._id = undefined;
+		duplicatedJson.detail.id = newId;
+		duplicatedJson.detail.name = `${duplicatedJson.detail.name} (Copy)`.substring(
+			0,
+			ProjectDetail.NAME_MAX_LENGTH
+		);
+		duplicatedJson.detail.createdAt = new Date().toISOString();
+		duplicatedJson.detail.updatedAt = new Date().toISOString();
+
+		// Instantiate and save
+		const duplicatedProject = Project.fromJSON(duplicatedJson) as Project;
+		await this.save(duplicatedProject);
+
+		// Copy assets directory if one exists
+		try {
+			const oldAssetDir = await this.getAssetFolderForProject(projectId);
+			const newAssetDir = await this.getAssetFolderForProject(newId);
+			if (await exists(oldAssetDir)) {
+				await mkdir(newAssetDir, { recursive: true });
+				const entries = await readDir(oldAssetDir);
+				for (const entry of entries) {
+					if (entry.isFile) {
+						try {
+							const { copyFile } = await import('@tauri-apps/plugin-fs');
+							await copyFile(`${oldAssetDir}/${entry.name}`, `${newAssetDir}/${entry.name}`);
+						} catch (e) {
+							console.warn('Could not copy a specific project asset:', e);
+						}
+					}
+				}
+			}
+		} catch (e) {
+			console.warn('Could not fully copy project assets folder:', e);
+		}
+
+		return duplicatedProject;
+	}
+
+	/**
+	 * Construit un nom de fichier sûr et unique dans un paquet de projet.
+	 * @param {string} fileName Nom original de l'asset.
+	 * @param {number} assetId Identifiant de l'asset.
+	 * @param {number} index Position de l'asset dans le projet.
+	 * @param {string} [prefix='asset'] Préfixe du nom généré.
+	 * @returns {string} Nom de fichier utilisable dans le paquet.
+	 */
+	private static getProjectPackageAssetFileName(
+		fileName: string,
+		assetId: number,
+		index: number,
+		prefix: string = 'asset'
+	): string {
+		const safeFileName =
+			fileName
+				.replace(/[\\/:*?"<>|]/g, '_')
+				.split('')
+				.map((character) => (character.charCodeAt(0) <= 31 ? '_' : character))
+				.join('')
+				.trim() || 'asset';
+		return `${prefix}-${assetId}-${index}-${safeFileName}`;
+	}
+
+	/**
+	 * Extrait les familles de polices importées utilisées dans un projet sérialisé.
+	 * @param {unknown} value Données sérialisées du projet.
+	 * @returns {Set<string>} Familles `QCImported-...` utilisées par le projet.
+	 */
+	private static collectProjectPackageFontFamilies(value: unknown): Set<string> {
+		const families = new Set<string>();
+		const pending: unknown[] = [value];
+
+		while (pending.length > 0) {
+			const current = pending.pop();
+			if (typeof current === 'string') {
+				for (const family of current.match(/\bQCImported-[A-Za-z0-9-]+\b/g) ?? []) {
+					families.add(family);
+				}
+				continue;
+			}
+			if (Array.isArray(current)) {
+				pending.push(...current);
+				continue;
+			}
+			if (current && typeof current === 'object') {
+				pending.push(...Object.values(current as Record<string, unknown>));
+			}
+		}
+
+		return families;
+	}
+
+	/**
+	 * Exporte un projet et tous ses assets locaux dans un fichier `.qc`.
+	 * @param {Project} project Projet à empaqueter.
+	 * @param {string} destination Chemin du fichier `.qc` à créer.
+	 * @returns {Promise<void>} Promesse résolue lorsque le paquet est écrit.
+	 */
+	static async exportProjectPackage(project: Project, destination: string): Promise<void> {
+		const projectPayload = project.toJSON();
+		const assets: ProjectPackageAssetDescriptor[] = project.content.assets.map((asset, index) => ({
+			id: asset.id,
+			sourcePath: asset.filePath,
+			fileName: this.getProjectPackageAssetFileName(asset.fileName, asset.id, index)
+		}));
+		const customImages: ProjectPackageCustomImageDescriptor[] = project.content.timeline.tracks
+			.flatMap((track) => track.clips)
+			.filter((clip): clip is CustomImageClip => clip instanceof CustomImageClip)
+			.map((clip, index) => {
+				const sourcePath = clip.getFilePath();
+				if (typeof sourcePath !== 'string' || sourcePath.trim().length === 0) {
+					throw new Error('Custom image does not have a valid file path.');
+				}
+
+				const sourceFileName = sourcePath.split(/[\\/]/).pop() || 'custom-image';
+				return {
+					clipId: clip.id,
+					sourcePath,
+					fileName: this.getProjectPackageAssetFileName(
+						sourceFileName,
+						clip.id,
+						index,
+						'custom-image'
+					)
+				};
+			});
+		const linkedImages: ProjectPackageLinkedImageDescriptor[] = project.content.timeline.tracks
+			.flatMap((track) => track.clips)
+			.flatMap((clip, index) => {
+				if (!(clip instanceof ClipWithTranslation)) return [];
+				const sourcePath = clip.getAssociatedImagePath();
+				if (typeof sourcePath !== 'string' || sourcePath.trim().length === 0) return [];
+
+				const sourceFileName = sourcePath.split(/[\\/]/).pop() || 'subtitle-image';
+				return [
+					{
+						kind: 'subtitle' as const,
+						clipId: clip.id,
+						sourcePath,
+						fileName: this.getProjectPackageAssetFileName(
+							sourceFileName,
+							clip.id,
+							index,
+							'subtitle-image'
+						)
+					}
+				];
+			});
+
+		const bannerPath = project.content.videoStyle
+			.getStylesOfTarget('global')
+			.findStyle('ayah-container-image')?.value;
+		if (
+			typeof bannerPath === 'string' &&
+			bannerPath.trim().length > 0 &&
+			(bannerPath.includes('/') || bannerPath.includes('\\'))
+		) {
+			const sourceFileName = bannerPath.split(/[\\/]/).pop() || 'ayah-container-image';
+			linkedImages.push({
+				kind: 'style',
+				styleId: 'ayah-container-image',
+				sourcePath: bannerPath,
+				fileName: this.getProjectPackageAssetFileName(
+					sourceFileName,
+					0,
+					linkedImages.length,
+					'style-image'
+				)
+			});
+		}
+
+		const importedFonts = await QPCFontProvider.loadImportedFonts();
+		const importedFontsByFamily = new Map(importedFonts.map((font) => [font.family, font]));
+		const fonts: ProjectPackageFontDescriptor[] = [];
+		for (const family of this.collectProjectPackageFontFamilies(projectPayload)) {
+			const font = importedFontsByFamily.get(family);
+			if (!font) {
+				throw new Error(`The project uses an unavailable imported font: ${family}`);
+			}
+			const fileName = font.path.split(/[\\/]/).pop();
+			if (!fileName) throw new Error(`The imported font has no valid file name: ${family}`);
+			fonts.push({ family, sourcePath: font.path, fileName });
+		}
+
+		await invoke('pack_project_archive', {
+			destination,
+			projectJson: JSON.stringify(projectPayload),
+			assets,
+			customImages,
+			linkedImages,
+			fonts
+		});
+	}
+
+	/**
+	 * Importe un paquet `.qc`, extrait ses assets et réécrit leurs chemins dans le projet.
+	 * @param {string} filePath Chemin du paquet `.qc`.
+	 * @returns {Promise<void>} Promesse résolue lorsque le projet est enregistré.
+	 */
+	static async importProjectPackage(filePath: string): Promise<void> {
+		const projectsPath = await this.getProjectsFolderPath();
+		let projectId = Utilities.randomId();
+		let assetsPath = await this.getAssetFolderForProject(projectId);
+
+		while (
+			(await exists(await join(projectsPath, `${projectId}.json`))) ||
+			(await exists(assetsPath))
+		) {
+			projectId = Utilities.randomId();
+			assetsPath = await this.getAssetFolderForProject(projectId);
+		}
+
+		const assetsPathExisted = await exists(assetsPath);
+		try {
+			const packageData = await invoke<ProjectPackageManifest>('unpack_project_archive', {
+				source: filePath,
+				destination: assetsPath
+			});
+			const rawProject = packageData?.project;
+			if (
+				!rawProject ||
+				typeof rawProject !== 'object' ||
+				!rawProject.detail ||
+				typeof rawProject.detail !== 'object'
+			) {
+				throw new Error('Invalid project package content.');
+			}
+
+			const rawContent = rawProject.content;
+			const rawAssets =
+				rawContent && typeof rawContent === 'object' && 'assets' in rawContent
+					? (rawContent as { assets?: unknown }).assets
+					: undefined;
+			if (
+				!Array.isArray(packageData?.assets) ||
+				!Array.isArray(rawAssets) ||
+				rawAssets.length !== packageData.assets.length
+			) {
+				throw new Error('Project package assets do not match the project.');
+			}
+
+			const packagedAssets = new Map<number, ProjectPackageAsset>();
+			for (const packagedAsset of packageData.assets) {
+				if (
+					!Number.isFinite(packagedAsset.id) ||
+					typeof packagedAsset.fileName !== 'string' ||
+					packagedAssets.has(packagedAsset.id)
+				) {
+					throw new Error('Invalid project package asset manifest.');
+				}
+				packagedAssets.set(packagedAsset.id, packagedAsset);
+			}
+
+			const projectAssetIds = new Set<number>();
+			for (const rawAsset of rawAssets) {
+				if (
+					!rawAsset ||
+					typeof rawAsset !== 'object' ||
+					typeof rawAsset.id !== 'number' ||
+					!Number.isFinite(rawAsset.id) ||
+					projectAssetIds.has(rawAsset.id)
+				) {
+					throw new Error('Invalid project package asset.');
+				}
+				projectAssetIds.add(rawAsset.id);
+				const packagedAsset = packagedAssets.get(rawAsset.id);
+				if (!packagedAsset) {
+					throw new Error('Project package asset manifest does not match the project.');
+				}
+				const writableAsset = rawAsset as Record<string, unknown>;
+				writableAsset.filePath = await join(assetsPath, packagedAsset.fileName);
+				writableAsset.exists = true;
+			}
+			if (projectAssetIds.size !== packagedAssets.size) {
+				throw new Error('Project package asset manifest does not match the project.');
+			}
+
+			const packagedCustomImages = packageData?.customImages;
+			if (packagedCustomImages !== undefined && !Array.isArray(packagedCustomImages)) {
+				throw new Error('Invalid project package custom image manifest.');
+			}
+
+			const rawTracks = (rawContent as { timeline?: { tracks?: unknown } } | undefined)?.timeline
+				?.tracks;
+			const rawClips = (Array.isArray(rawTracks) ? rawTracks : []).flatMap((rawTrack) => {
+				const rawClips = (rawTrack as { clips?: unknown } | null)?.clips;
+				if (!Array.isArray(rawClips)) return [];
+				return rawClips.filter((rawClip): rawClip is Record<string, unknown> => {
+					return !!rawClip && typeof rawClip === 'object';
+				});
+			});
+			const rawCustomImageClips = rawClips.filter((rawClip) => {
+				return (
+					rawClip.type === 'Custom Image' &&
+					typeof rawClip.id === 'number' &&
+					Number.isFinite(rawClip.id)
+				);
+			});
+
+			const customImageClipIds = new Set<number>();
+			for (const packagedCustomImage of packagedCustomImages ?? []) {
+				if (
+					!packagedCustomImage ||
+					typeof packagedCustomImage.clipId !== 'number' ||
+					!Number.isFinite(packagedCustomImage.clipId) ||
+					typeof packagedCustomImage.fileName !== 'string' ||
+					customImageClipIds.has(packagedCustomImage.clipId)
+				) {
+					throw new Error('Invalid project package custom image manifest.');
+				}
+				customImageClipIds.add(packagedCustomImage.clipId);
+
+				const rawCustomImageClip = rawCustomImageClips.find(
+					(rawClip) => rawClip.id === packagedCustomImage.clipId
+				);
+				if (!rawCustomImageClip) {
+					throw new Error('Project package custom image manifest does not match the project.');
+				}
+
+				const rawCategory = rawCustomImageClip.category;
+				const rawStyles =
+					rawCategory && typeof rawCategory === 'object' && 'styles' in rawCategory
+						? (rawCategory as { styles?: unknown }).styles
+						: undefined;
+				const rawFilePathStyle = (Array.isArray(rawStyles) ? rawStyles : []).find((style) => {
+					if (!style || typeof style !== 'object') return false;
+					return (style as Record<string, unknown>).id === 'filepath';
+				});
+				if (!rawFilePathStyle || typeof rawFilePathStyle !== 'object') {
+					throw new Error('Project package custom image is missing its file path style.');
+				}
+				(rawFilePathStyle as Record<string, unknown>).value = await join(
+					assetsPath,
+					packagedCustomImage.fileName
+				);
+			}
+
+			const packagedLinkedImages = packageData?.linkedImages;
+			if (packagedLinkedImages !== undefined && !Array.isArray(packagedLinkedImages)) {
+				throw new Error('Invalid project package linked image manifest.');
+			}
+
+			const rawClipsById = new Map<number, Record<string, unknown>>();
+			for (const rawClip of rawClips) {
+				if (typeof rawClip.id === 'number' && Number.isFinite(rawClip.id)) {
+					rawClipsById.set(rawClip.id, rawClip);
+				}
+			}
+
+			const linkedClipIds = new Set<number>();
+			const linkedStyleIds = new Set<string>();
+			for (const packagedLinkedImage of packagedLinkedImages ?? []) {
+				if (
+					!packagedLinkedImage ||
+					typeof packagedLinkedImage.kind !== 'string' ||
+					typeof packagedLinkedImage.fileName !== 'string'
+				) {
+					throw new Error('Invalid project package linked image manifest.');
+				}
+
+				if (packagedLinkedImage.kind === 'subtitle') {
+					if (
+						typeof packagedLinkedImage.clipId !== 'number' ||
+						!Number.isFinite(packagedLinkedImage.clipId) ||
+						packagedLinkedImage.styleId !== undefined ||
+						linkedClipIds.has(packagedLinkedImage.clipId)
+					) {
+						throw new Error('Invalid project package linked image manifest.');
+					}
+					linkedClipIds.add(packagedLinkedImage.clipId);
+					const rawClip = rawClipsById.get(packagedLinkedImage.clipId);
+					if (!rawClip) {
+						throw new Error('Project package linked image manifest does not match the project.');
+					}
+					rawClip.associatedImagePath = await join(assetsPath, packagedLinkedImage.fileName);
+					continue;
+				}
+
+				if (
+					packagedLinkedImage.kind !== 'style' ||
+					packagedLinkedImage.styleId !== 'ayah-container-image' ||
+					packagedLinkedImage.clipId !== undefined ||
+					linkedStyleIds.has(packagedLinkedImage.styleId)
+				) {
+					throw new Error('Invalid project package linked image manifest.');
+				}
+				linkedStyleIds.add(packagedLinkedImage.styleId);
+
+				const rawVideoStyle =
+					rawContent && typeof rawContent === 'object' && 'videoStyle' in rawContent
+						? (rawContent as { videoStyle?: unknown }).videoStyle
+						: undefined;
+				const rawStyleGroups =
+					rawVideoStyle && typeof rawVideoStyle === 'object' && 'styles' in rawVideoStyle
+						? (rawVideoStyle as { styles?: unknown }).styles
+						: undefined;
+				const rawGlobalStyleGroup = (Array.isArray(rawStyleGroups) ? rawStyleGroups : []).find(
+					(group) =>
+						group &&
+						typeof group === 'object' &&
+						(group as Record<string, unknown>).target === 'global'
+				);
+				const rawGlobalCategories =
+					rawGlobalStyleGroup &&
+					typeof rawGlobalStyleGroup === 'object' &&
+					'categories' in rawGlobalStyleGroup
+						? (rawGlobalStyleGroup as { categories?: unknown }).categories
+						: undefined;
+				const rawBannerStyle = (Array.isArray(rawGlobalCategories) ? rawGlobalCategories : [])
+					.flatMap((category) => {
+						if (!category || typeof category !== 'object' || !('styles' in category)) return [];
+						const styles = (category as { styles?: unknown }).styles;
+						return Array.isArray(styles) ? styles : [];
+					})
+					.find(
+						(style) =>
+							style &&
+							typeof style === 'object' &&
+							(style as Record<string, unknown>).id === packagedLinkedImage.styleId
+					);
+				if (!rawBannerStyle || typeof rawBannerStyle !== 'object') {
+					throw new Error('Project package linked image is missing its style.');
+				}
+				(rawBannerStyle as Record<string, unknown>).value = await join(
+					assetsPath,
+					packagedLinkedImage.fileName
+				);
+			}
+
+			const packagedFonts = packageData?.fonts;
+			if (packagedFonts !== undefined && !Array.isArray(packagedFonts)) {
+				throw new Error('Invalid project package font manifest.');
+			}
+			const projectFontFamilies = this.collectProjectPackageFontFamilies(rawProject);
+			const packagedFontFamilies = new Set<string>();
+			for (const packagedFont of packagedFonts ?? []) {
+				if (
+					!packagedFont ||
+					typeof packagedFont.family !== 'string' ||
+					!packagedFont.family.startsWith('QCImported-') ||
+					typeof packagedFont.fileName !== 'string' ||
+					packagedFont.fileName.length === 0 ||
+					packagedFontFamilies.has(packagedFont.family)
+				) {
+					throw new Error('Invalid project package font manifest.');
+				}
+				packagedFontFamilies.add(packagedFont.family);
+			}
+			if (
+				packagedFonts !== undefined &&
+				(projectFontFamilies.size !== packagedFontFamilies.size ||
+					[...projectFontFamilies].some((family) => !packagedFontFamilies.has(family)))
+			) {
+				throw new Error('Project package font manifest does not match the project.');
+			}
+			for (const packagedFont of packagedFonts ?? []) {
+				await QPCFontProvider.restoreImportedFontFile(
+					await join(assetsPath, 'fonts', packagedFont.fileName),
+					packagedFont.fileName,
+					packagedFont.family
+				);
+			}
+
+			rawProject.detail.id = projectId;
+			const projectObject = Project.fromJSON(rawProject) as Project;
+			await ProjectHistoryManager.ignoreAsync(() =>
+				projectObject.content.videoStyle.ensureStylesSchemaUpToDate(projectObject.content)
+			);
+			await projectObject.save();
+		} catch (error) {
+			if (!assetsPathExisted && (await exists(assetsPath))) {
+				await remove(assetsPath, { recursive: true });
+			}
+			throw error;
+		}
+	}
+
+	/**
+	 * Importe un projet à partir d'un fichier JSON.
+	 * @param json Le contenu JSON du projet
+	 */
+	static async importProject(json: ImportedProjectPayload) {
+		json.detail.id = Utilities.randomId(); // Applique un nouvel ID unique au projet
+
+		const projectObject = Project.fromJSON(json) as Project;
+		await projectObject.save(); // Enregistre le projet importé sur le disque
+	}
+
+	/**
+	 * Import projects from a backup.
+	 * @param projects The list of projects to import
+	 * @returns An object containing the import results
+	 */
+	static async importProjectsBackup(projects: ImportedProjectPayload[]): Promise<{
+		imported: number;
+		skipped: number;
+		invalid: number;
+	}> {
+		if (!Array.isArray(projects)) {
+			throw new Error('Backup file must contain an array of projects.');
+		}
+
+		const projectsPath = await this.ensureFolder(this.projectsFolder);
+		const existingEntries = await readDir(projectsPath);
+		const existingIds = new Set<number>(
+			existingEntries
+				.filter((entry) => entry.isFile && !!entry.name && entry.name.endsWith('.json'))
+				.map((entry) => Number.parseInt((entry.name as string).replace('.json', ''), 10))
+				.filter((id) => Number.isFinite(id))
+		);
+
+		let imported = 0;
+		let skipped = 0;
+		let invalid = 0;
+		const seenBackupIds = new Set<number>();
+
+		for (const rawProject of projects) {
+			const projectId = rawProject?.detail?.id;
+
+			if (typeof projectId !== 'number' || !Number.isFinite(projectId)) {
+				invalid++;
+				continue;
+			}
+
+			if (existingIds.has(projectId) || seenBackupIds.has(projectId)) {
+				skipped++;
+				continue;
+			}
+
+			try {
+				const projectObject = Project.fromJSON(rawProject) as Project;
+				await this.save(projectObject);
+				existingIds.add(projectId);
+				seenBackupIds.add(projectId);
+				imported++;
+			} catch (error) {
+				console.warn(`Failed to import backup project ${projectId}:`, error);
+				invalid++;
+			}
+		}
+
+		await this.loadUserProjectsDetails();
+
+		return { imported, skipped, invalid };
+	}
+}

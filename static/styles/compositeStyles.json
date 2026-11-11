@@ -1,0 +1,175 @@
+[
+	{
+		"id": "opacity",
+		"name": "Text Opacity",
+		"description": "Control the transparency of the text",
+		"value": 1,
+		"valueType": "number",
+		"valueMin": 0,
+		"valueMax": 1,
+		"step": 0.01,
+		"css": "opacity: {value};",
+		"tailwind": false,
+
+		"icon": "opacity"
+	},
+	{
+		"id": "font-family",
+		"name": "Font",
+		"description": "Select the font family for the text",
+		"value": "Candara",
+		"valueType": "select",
+		"options": [],
+		"css": "font-family: '{value}', sans-serif;",
+		"tailwind": false,
+
+		"icon": "font_download"
+	},
+	{
+		"id": "font-size",
+		"name": "Font Size",
+		"description": "Adjust the size of the text",
+		"value": 60,
+		"valueType": "number",
+		"valueMin": 4,
+		"valueMax": 200,
+		"css": "font-size: {value}px;",
+		"tailwind": false,
+
+		"icon": "format_size"
+	},
+	{
+		"id": "rotation",
+		"name": "Rotation",
+		"description": "Rotate the text in degrees",
+		"value": 0,
+		"valueType": "number",
+		"valueMin": -180,
+		"valueMax": 180,
+		"step": 1,
+		"css": "rotate: {value}deg;",
+		"tailwind": false,
+		"icon": "rotate_right"
+	},
+	{
+		"id": "text-color",
+		"name": "Color",
+		"description": "Change the color of the text",
+		"value": "#ffffff",
+		"valueType": "color",
+		"css": "color: {value};",
+		"tailwind": false,
+		"icon": "palette"
+	},
+	{
+		"id": "text-transform",
+		"name": "Text Transform",
+		"description": "Control the capitalization of the text",
+		"value": "none",
+		"valueType": "select",
+		"options": ["none", "capitalize", "uppercase", "lowercase"],
+		"css": "text-transform: {value};",
+		"tailwind": false,
+
+		"icon": "text_fields"
+	},
+	{
+		"id": "font-weight",
+		"name": "Font Weight",
+		"description": "Set the thickness of the font",
+		"value": "normal",
+		"valueType": "select",
+		"options": ["normal", "bold", "lighter", "bolder"],
+		"css": "font-weight: {value};",
+		"tailwind": false,
+		"icon": "format_bold"
+	},
+	{
+		"id": "enable-italic",
+		"name": "Enable Italic",
+		"description": "Enable italic styling for the text",
+		"value": false,
+		"valueType": "boolean",
+		"css": "font-style: italic;",
+		"tailwind": false,
+		"icon": "format_italic"
+	},
+	{
+		"id": "custom-css",
+		"name": "Custom CSS",
+		"description": "Write any custom CSS for custom text. Use !important if needed.",
+		"value": "",
+		"valueType": "text",
+		"css": "{value}",
+		"tailwind": false,
+		"icon": "code"
+	},
+	{
+		"id": "outline-enable",
+		"name": "Outline",
+		"description": "Enable or disable text outline",
+		"value": false,
+		"valueType": "boolean",
+		"css": "",
+		"tailwind": false,
+
+		"icon": "toggle_on"
+	},
+	{
+		"id": "text-outline",
+		"name": "Outline Thickness",
+		"description": "Set the width of the text outline",
+		"value": 4,
+		"valueType": "number",
+		"valueMin": 0,
+		"valueMax": 20,
+		"step": 0.01,
+		"css": "-webkit-text-stroke: calc({value}px * 2) var(--text-outline-color); paint-order: stroke fill;",
+		"tailwind": false,
+
+		"icon": "line_weight"
+	},
+	{
+		"id": "text-outline-color",
+		"name": "Outline Colour",
+		"description": "Set the color of the text outline",
+		"value": "#000000",
+		"valueType": "color",
+		"css": "--text-outline-color: {value};",
+		"tailwind": false,
+
+		"icon": "palette"
+	},
+	{
+		"id": "text-glow-enable",
+		"name": "Enable Glow",
+		"description": "Enable or disable text glow",
+		"value": false,
+		"valueType": "boolean",
+		"css": "",
+		"tailwind": false,
+		"icon": "toggle_on"
+	},
+	{
+		"id": "text-glow-color",
+		"name": "Glow Color",
+		"description": "Set the color of the text glow",
+		"value": "#ffffff",
+		"valueType": "color",
+		"css": "--text-glow-color: {value}; --text-glow-shadow: 0 0 calc(var(--text-glow-blur) * 0.5) var(--text-glow-color), 0 0 var(--text-glow-blur) var(--text-glow-color), 0 0 calc(var(--text-glow-blur) * 2) var(--text-glow-color); text-shadow: var(--wbw-word-glow-shadow, 0 0 0 transparent), var(--inline-word-glow-shadow, 0 0 0 transparent), var(--text-neon-shadow, 0 0 0 transparent), var(--text-glow-shadow, 0 0 0 transparent), var(--text-drop-shadow, 0 0 0 transparent);",
+		"tailwind": false,
+		"icon": "palette"
+	},
+	{
+		"id": "text-glow-blur",
+		"name": "Glow Blur",
+		"description": "Set the blur radius of the text glow",
+		"value": 10,
+		"valueType": "number",
+		"valueMin": 0,
+		"valueMax": 50,
+		"css": "--text-glow-blur: {value}px;",
+		"tailwind": false,
+		"icon": "blur_on"
+	}
+]

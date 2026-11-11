@@ -1,0 +1,270 @@
+import { SerializableBase } from './misc/SerializableBase';
+
+import { globalState } from '$lib/runes/main.svelte';
+import { Edition, Utilities } from '.';
+import { Duration } from './index.js';
+import { VerseRange } from './VerseRange.svelte';
+import { Status } from './Status';
+import type { ClipWithTranslation, SubtitleClip } from './Clip.svelte';
+import type { ExportState } from './ProjectEditorState.svelte';
+import type { AssetTrack, SubtitleTrack } from './Track.svelte';
+import { VerseTranslation } from './Translation.svelte';
+import { Quran } from './Quran';
+import {
+	DEFAULT_PROJECT_TYPE,
+	normalizeProjectType,
+	type ProjectType
+} from '$lib/types/projectType';
+import { DEFAULT_EXPORT_FILE_NAME_FORMAT } from '$lib/constants/export';
+
+export class ProjectDetail extends SerializableBase {
+	static NAME_MAX_LENGTH: number = 150;
+	static RECITER_MAX_LENGTH: number = 35;
+
+	id: number;
+
+	name: string;
+	reciter: string;
+	projectType: ProjectType;
+	createdAt: Date;
+	updatedAt: Date;
+	batchId: number | null;
+	batchOrder: number | null;
+
+	verseRange: VerseRange;
+	duration: Duration;
+	percentageCaptioned: number;
+	status: Status;
+
+	// Format : author: percentage
+	translations: { [author: string]: number };
+
+	/**
+	 * Crée une nouvelle instance de ProjectDetail
+	 * @param name Nom du projet
+	 * @param reciter Nom du réciteur
+	 * @param createdAt Date de création éventuelle
+	 * @param updatedAt Date de modification éventuelle
+	 * @param projectType Type du projet
+	 * @param batchId Identifiant éventuel du batch parent
+	 * @param batchOrder Position éventuelle dans le batch parent
+	 */
+	constructor(
+		name: string,
+		reciter: string,
+		createdAt?: Date,
+		updatedAt?: Date,
+		projectType: ProjectType = DEFAULT_PROJECT_TYPE,
+		batchId: number | null = null,
+		batchOrder: number | null = null
+	) {
+		super();
+
+		this.id = Utilities.randomId();
+
+		this.name = $state(name);
+		this.reciter = $state(reciter || 'not set');
+		this.projectType = $state(normalizeProjectType(projectType));
+		this.createdAt = $state(createdAt || new Date());
+		this.updatedAt = $state(updatedAt || new Date());
+		this.batchId = $state(batchId);
+		this.batchOrder = $state(batchOrder);
+
+		this.percentageCaptioned = $state(0);
+		this.status = $state(Status.NOT_SET);
+		this.duration = new Duration(0);
+		this.verseRange = new VerseRange();
+		this.translations = $state({});
+	}
+
+	/**
+	 * Met à jour la date de dernière modification du projet
+	 */
+	public updateTimestamp(): void {
+		this.updatedAt = new Date();
+	}
+
+	/**
+	 * Met à jour le pourcentage de sous-titres captionnés par rapport
+	 * à la durée total de la vidéo du projet
+	 */
+	public updateVideoDetailAttributes() {
+		this.duration = new Duration(globalState.getAudioTrack.getDuration().ms || 0);
+		this.updateVideoPercentageCaptioned();
+		this.updateVerseRange();
+	}
+
+	/**
+	 * Met à jour les détails média depuis une piste audio explicite.
+	 * @param {AssetTrack} audioTrack Piste du projet traité en arrière-plan.
+	 * @returns {void}
+	 */
+	public updateMediaDetailAttributes(audioTrack: AssetTrack): void {
+		this.duration = new Duration(audioTrack.getDuration().ms || 0);
+		this.percentageCaptioned = 0;
+	}
+
+	/**
+	 * Met à jour les détails vidéo depuis les pistes explicites d'un projet.
+	 * @param {AssetTrack} audioTrack Piste audio du projet.
+	 * @param {SubtitleTrack} subtitleTrack Piste de sous-titres du projet.
+	 * @returns {void}
+	 */
+	public updateVideoDetailAttributesForTracks(
+		audioTrack: AssetTrack,
+		subtitleTrack: SubtitleTrack
+	): void {
+		const totalDuration = audioTrack.getDuration().ms || 0;
+		const captionedDuration = subtitleTrack.getDuration().ms || 0;
+		let percentage = totalDuration > 0 ? (captionedDuration / totalDuration) * 100 : 0;
+		if (percentage >= 97) percentage = 100;
+		this.duration = new Duration(totalDuration);
+		this.percentageCaptioned = Math.floor(percentage);
+		this.verseRange = VerseRange.getVerseRangeFromClips(
+			subtitleTrack.clips.filter((clip) => clip.type === 'Subtitle') as SubtitleClip[],
+			0,
+			captionedDuration
+		);
+	}
+
+	private updateVideoPercentageCaptioned() {
+		const captionedDuration = globalState.getSubtitleTrack.getDuration().ms || 0;
+
+		const totalDuration = globalState.getAudioTrack.getDuration().ms || 0;
+
+		let percentage = (captionedDuration / totalDuration) * 100;
+		if (percentage >= 97) {
+			percentage = 100;
+		}
+
+		globalState.currentProject!.detail.percentageCaptioned = Math.floor(percentage);
+	}
+
+	private updateVerseRange() {
+		// Update la verse range pour toute la vidéo
+		this.verseRange = VerseRange.getVerseRange(0, globalState.getSubtitleTrack.getDuration().ms);
+	}
+
+	/**
+	 * Retourne la sourate couvrant le plus de versets dans le projet.
+	 * @returns {number | null} Numéro de la sourate principale, ou `null` sans verset.
+	 */
+	getProminentSurah(): number | null {
+		if (this.verseRange.parts.length === 0) return null;
+
+		return this.verseRange.parts.reduce((prominentPart, part) => {
+			const prominentVerseCount = prominentPart.verseEnd - prominentPart.verseStart + 1;
+			const verseCount = part.verseEnd - part.verseStart + 1;
+			if (verseCount !== prominentVerseCount) {
+				return verseCount > prominentVerseCount ? part : prominentPart;
+			}
+			return part.surah < prominentPart.surah ? part : prominentPart;
+		}).surah;
+	}
+
+	/**
+	 * Met à jour le pourcentage de complétion des traductions du projet pour
+	 * une édition donnée
+	 * @param edition L'édition à mettre à jour
+	 */
+	updatePercentageTranslated(edition: Edition) {
+		// Calcul le nbre de traduction complété/nbre de traduction total
+		let total: number = 0;
+		let completed: number = 0;
+
+		for (const subtitle of globalState.getSubtitleTrack.clips) {
+			if (subtitle.type === 'Subtitle' || subtitle.type === 'Pre-defined Subtitle') {
+				const translations = (subtitle as ClipWithTranslation).translations;
+				if (translations && translations[edition.name]) {
+					// Si la traduction existe, on l'ajoute au pourcentage
+					if (!(translations[edition.name] instanceof VerseTranslation)) continue;
+
+					if (translations[edition.name].isStatusComplete()) {
+						completed++;
+					}
+
+					total++;
+				}
+			}
+		}
+
+		globalState.currentProject!.detail.translations[edition.author] = Math.floor(
+			total > 0 ? (completed / total) * 100 : 0
+		);
+	}
+
+	matchSearchQuery(searchQuery: string): boolean {
+		const normalizedProjectInfo = `${this.name} ${this.reciter} ${this.projectType} ${this.verseRange.toString()}`;
+		return this.normalize(normalizedProjectInfo).includes(this.normalize(searchQuery));
+	}
+
+	normalize(str: string) {
+		return str.trim().toLowerCase().replaceAll(/\s+/g, ' ').replaceAll('-', '').replaceAll("'", '');
+	}
+
+	/**
+	 * Génère, en fonction des paramètres d'export actuels, le nom du fichier d'export.
+	 * @param {Pick<ExportState, 'customFileName' | 'videoStartTime' | 'videoEndTime'>} exportState Paramètres d'export à utiliser.
+	 * @param {SubtitleClip[] | undefined} subtitleClips Sous-titres du projet à utiliser pour calculer la plage.
+	 */
+	generateExportFileName(
+		exportState: Pick<
+			ExportState,
+			'customFileName' | 'videoStartTime' | 'videoEndTime'
+		> = globalState.getExportState,
+		subtitleClips?: SubtitleClip[]
+	): string {
+		// Si un nom de fichier personnalisé est défini, l'utiliser
+		const customFileName = exportState.customFileName.trim();
+		if (customFileName) {
+			const sanitized = customFileName.replace(/[/\\:*?"<>|]/g, '_');
+			return sanitized;
+		}
+
+		const verseRange = subtitleClips
+			? VerseRange.getVerseRangeFromClips(
+					subtitleClips,
+					exportState.videoStartTime,
+					exportState.videoEndTime
+				)
+			: VerseRange.getVerseRange(exportState.videoStartTime, exportState.videoEndTime);
+		const surahNumbers = verseRange.parts.map((part) => part.surah);
+		const values = {
+			project_name: this.name,
+			reciter: this.reciter,
+			verse_range: verseRange.toStringForExportFile(),
+			surah: surahNumbers
+				.map((surahNumber) => Quran.getSurahsNames()[surahNumber - 1]?.transliteration)
+				.filter(Boolean)
+				.join(', '),
+			surah_number: surahNumbers.join(', ')
+		};
+		const format =
+			globalState.settings?.defaultValuesSettings.exportFileNameFormat.trim() ||
+			DEFAULT_EXPORT_FILE_NAME_FORMAT;
+		const finalFileName = Object.entries(values).reduce(
+			(fileName, [placeholder, value]) => fileName.replaceAll(`{${placeholder}}`, value),
+			format
+		);
+		return finalFileName.replace(/[/\\:*?"<>|]/g, '');
+	}
+
+	static override fromJSON<T extends SerializableBase>(
+		this: any,
+		data: Record<string, unknown>
+	): T {
+		const detail = super.fromJSON.call(this, data) as T;
+		if (detail instanceof ProjectDetail) {
+			detail.reciter = detail.reciter || 'not set';
+			detail.projectType = normalizeProjectType(detail.projectType);
+			detail.batchId = detail.batchId ?? null;
+			detail.batchOrder = detail.batchOrder ?? null;
+		}
+		return detail;
+	}
+}
+
+// Enregistre les classes enfants pour la désérialisation automatique
+SerializableBase.registerChildClass(ProjectDetail, 'duration', Duration);
+SerializableBase.registerChildClass(ProjectDetail, 'status', Status);
+SerializableBase.registerChildClass(ProjectDetail, 'verseRange', VerseRange);

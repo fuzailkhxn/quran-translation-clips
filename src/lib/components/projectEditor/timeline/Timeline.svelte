@@ -1,0 +1,1760 @@
+<script lang="ts">
+	import LL from '$lib/i18n/i18n-svelte';
+	import { globalState, type QuickTimelineEditorMode } from '$lib/runes/main.svelte';
+	import { onDestroy, onMount } from 'svelte';
+	import TrackComponent from './track/Track.svelte';
+	import {
+		Duration,
+		TrackType,
+		ProjectEditorTabs,
+		AssetClip,
+		SubtitleClip,
+		PredefinedSubtitleClip,
+		SilenceClip,
+		type Track
+	} from '$lib/classes';
+	import { markClipAsVerified } from '$lib/classes/Clip.svelte';
+	import ShortcutService from '$lib/services/ShortcutService';
+	import {
+		handleManualWordByWordEditShortcutKeyDown,
+		handleManualWordByWordEditShortcutKeyUp,
+		moveManualWordByWordSelectedWordEndToCursor,
+		moveManualWordByWordSelectedWordStartToCursor
+	} from '$lib/services/WbwHelper';
+	import { getTimelineCustomClips } from './track/timelineCustomClip';
+	import Settings from '$lib/classes/Settings.svelte';
+	import QuickTimelineEditorOverlay from './QuickTimelineEditorOverlay.svelte';
+	import TimelineKeyframeMarkers from './TimelineKeyframeMarkers.svelte';
+	import { ProjectHistoryManager } from '$lib/services/undoRedo/ProjectHistoryManager';
+	import { scheduleWbwRealign } from '$lib/services/AutoSegmentation';
+
+	let totalDuration = $derived(() => {
+		// Récupère la fin du clip le plus loin dans la timeline
+		const project = globalState.currentProject;
+		const longestClipEnd = project?.content.timeline.getLongestTrackDuration() ?? new Duration(0);
+
+		// Pas de projet ouvert (fermeture/rechargement HMR) : ne pas déréférencer null.
+		if (project) project.detail.duration = longestClipEnd;
+
+		if (!longestClipEnd.isNull())
+			return new Duration(
+				// Ajoute 2 minutes pour pas que la timeline soit au ras bord
+				longestClipEnd.ms + 120000
+			);
+		else return new Duration(120000); // 2 minutes par défaut
+	});
+
+	let timelineState = $derived(
+		() =>
+			globalState.currentProject?.projectEditorState.timeline ?? {
+				cursorPosition: 0,
+				movePreviewTo: 0,
+				previewRefreshToken: 0,
+				zoom: 1,
+				scrollX: 0,
+				showCursor: true,
+				wasCursorDragged: false
+			}
+	);
+
+	const TIMELINE_LEFT_HEADER_WIDTH_PX = 180;
+	const OVERSCAN_MS = 120000;
+	const quickEditorShortcutModes = {
+		EDIT_SUBTITLE_AT_CURSOR: 'subtitle',
+		EDIT_TRANSLATION_AT_CURSOR: 'translation',
+		EDIT_WBW_TIMESTAMP_AT_CURSOR: 'wbwTimestamp',
+		EDIT_WBW_STYLE_AT_CURSOR: 'wbw'
+	} as const satisfies Record<string, QuickTimelineEditorMode>;
+
+	let timelineDiv: HTMLDivElement | null = null;
+	let timelineTracksDiv: HTMLDivElement | null = null;
+	let tracksResizeObserver: ResizeObserver | null = null;
+	let tracksViewportWidth = $state(0);
+	let visibleRangeStartMs = $state(0);
+	let visibleRangeEndMs = $state(0);
+	let thumbnailRangeStartMs = $state(0);
+	let thumbnailRangeEndMs = $state(0);
+	let visibleSeconds = $derived(() => {
+		const startSecond = Math.max(0, Math.floor(visibleRangeStartMs / 1000));
+		const endSecond = Math.min(totalDuration().toSeconds(), Math.ceil(visibleRangeEndMs / 1000));
+		const count = Math.max(0, endSecond - startSecond + 1);
+		return Array.from({ length: count }, (_, index) => startSecond + index);
+	});
+	let orderedTrackItems = $derived(() => {
+		const order = globalState.settings?.persistentUiState.timelineTrackOrder ?? [];
+		return globalState
+			.currentProject!.content.timeline.tracks.map((track, index) => ({ track, index }))
+			.filter(
+				({ track }) =>
+					!(track.type === TrackType.CustomClip && getTimelineCustomClips().length === 0)
+			)
+			.sort((a, b) => {
+				const aIndex = order.indexOf(a.track.type);
+				const bIndex = order.indexOf(b.track.type);
+				return (aIndex === -1 ? order.length : aIndex) - (bIndex === -1 ? order.length : bIndex);
+			});
+	});
+
+	let removeShortcutRegistered = false;
+	let splitShortcutRegistered = false;
+	let quickSubtitleEditShortcutRegistered = false;
+	let quickEditorShortcutsRegistered = false;
+	let setEndShortcutRegistered = false;
+	let setStartShortcutRegistered = false;
+	let frameBackwardShortcutRegistered = false;
+	let frameForwardShortcutRegistered = false;
+	let refetchWbwShortcutRegistered = false;
+	let removeSubtitleAtCursorShortcutRegistered = false;
+	let quickMergeShortcutRegistered = false;
+	let nextMarkedSegmentShortcutRegistered = false;
+	let previousMarkedSegmentShortcutRegistered = false;
+	let lastVerifiedClipId: number | null = null;
+	let quickEditLongPressTimer: ReturnType<typeof setTimeout> | null = null;
+	let didTriggerQuickLongPressAction = false;
+
+	// Supprime les sous-titres actuellement sélectionnés dans le Style tab via Backspace
+	function handleRemoveSelectedSubtitles(): void {
+		const currentProject = globalState.currentProject;
+		if (!currentProject) return;
+
+		const selectedClipIds = globalState.getStylesState.selectedSubtitles.map(
+			(subtitle) => subtitle.id
+		);
+		if (selectedClipIds.length === 0) return;
+
+		const subtitleTrack = globalState.getSubtitleTrack;
+		globalState.getStylesState.clearSelection();
+
+		selectedClipIds.forEach((id) => subtitleTrack.removeClip(id, true));
+		currentProject.detail.updateVideoDetailAttributes();
+	}
+
+	/**
+	 * Supprime le clip de sous-titre ou de silence situé sous le curseur.
+	 * @returns {void}
+	 */
+	function handleRemoveSubtitleAtCursor(): void {
+		const currentProject = globalState.currentProject;
+		if (!currentProject) return;
+
+		const subtitleTrack = globalState.getSubtitleTrack;
+		const clip = subtitleTrack.getCurrentClip(globalState.getTimelineState.cursorPosition);
+		if (
+			!(
+				clip instanceof SubtitleClip ||
+				clip instanceof PredefinedSubtitleClip ||
+				clip instanceof SilenceClip
+			)
+		)
+			return;
+
+		if (globalState.getStylesState.isSelected(clip.id)) {
+			globalState.getStylesState.removeSelection(clip.id);
+		}
+		subtitleTrack.removeClip(clip.id, true);
+		currentProject.detail.updateVideoDetailAttributes();
+	}
+
+	async function handleSplitSubtitle(forceExactCursor: boolean): Promise<void> {
+		const currentProject = globalState.currentProject;
+		if (!currentProject) return;
+
+		let clipToSplit: SubtitleClip | PredefinedSubtitleClip | SilenceClip | null = null;
+
+		const selectedSubtitles = globalState.getStylesState.selectedSubtitles;
+		if (selectedSubtitles.length === 1) {
+			clipToSplit = selectedSubtitles[0];
+		} else {
+			const cursorPosition = globalState.getTimelineState.cursorPosition;
+			const subtitleTrack = globalState.getSubtitleTrack;
+			const clipUnderCursor = subtitleTrack.getCurrentClip(cursorPosition);
+
+			if (
+				clipUnderCursor &&
+				(clipUnderCursor.type === 'Subtitle' ||
+					clipUnderCursor.type === 'Pre-defined Subtitle' ||
+					clipUnderCursor.type === 'Silence')
+			) {
+				clipToSplit = clipUnderCursor;
+			}
+		}
+
+		if (
+			clipToSplit &&
+			(clipToSplit.type === 'Subtitle' ||
+				clipToSplit.type === 'Pre-defined Subtitle' ||
+				clipToSplit.type === 'Silence')
+		) {
+			const subtitleTrack = globalState.getSubtitleTrack;
+			const success = await subtitleTrack.splitSubtitle(clipToSplit.id, {
+				forceExactCursor
+			});
+			if (success) {
+				currentProject.detail.updateVideoDetailAttributes();
+				globalState.getStylesState.clearSelection();
+
+				// Start editing the first subtitle
+				// only if we are on the subtitles editor tab
+				if (
+					globalState.currentProject?.projectEditorState.currentTab ===
+					ProjectEditorTabs.SubtitlesEditor
+				) {
+					globalState.getSubtitlesEditorState.editSubtitle = clipToSplit;
+					const nextClip = subtitleTrack.getClipAfter(clipToSplit.id);
+					globalState.getSubtitlesEditorState.pendingSplitEditNextId = nextClip?.id ?? null;
+				}
+			}
+		}
+	}
+
+	/**
+	 * Déplace le curseur de lecture d'une frame dans la direction demandée.
+	 * @param {number} direction Direction du déplacement (`-1` ou `1`).
+	 * @returns {void}
+	 */
+	function moveCursorByFrame(direction: number): void {
+		if (globalState.getVideoPreviewState.isPlaying) return;
+
+		const frameDurationMs = 1000 / Math.max(globalState.getExportState.fps, 1);
+		const newPosition = Math.max(1, timelineState().cursorPosition + direction * frameDurationMs);
+
+		timelineState().cursorPosition = newPosition;
+		timelineState().movePreviewTo = newPosition;
+		globalState.getVideoPreviewState.scrollTimelineToCursor();
+	}
+
+	/**
+	 * Déplace le curseur d'une frame vers l'arrière.
+	 * @returns {void}
+	 */
+	function handleMoveFrameBackward(): void {
+		moveCursorByFrame(-1);
+	}
+
+	/**
+	 * Déplace le curseur d'une frame vers l'avant.
+	 * @returns {void}
+	 */
+	function handleMoveFrameForward(): void {
+		moveCursorByFrame(1);
+	}
+
+	/**
+	 * Déplace le curseur vers le premier segment marqué situé à sa droite.
+	 * @returns {void}
+	 */
+	function handleNextMarkedSegment(): void {
+		const nextClip = globalState.getSubtitleTrack.getNextMarkedClip(timelineState().cursorPosition);
+		if (!nextClip) return;
+
+		timelineState().cursorPosition = nextClip.startTime;
+		timelineState().movePreviewTo = nextClip.startTime;
+		globalState.getVideoPreviewState.scrollTimelineToCursor();
+	}
+
+	/**
+	 * Déplace le curseur vers le premier segment marqué situé à sa gauche.
+	 * @returns {void}
+	 */
+	function handlePreviousMarkedSegment(): void {
+		const previousClip = globalState.getSubtitleTrack.getPreviousMarkedClip(
+			timelineState().cursorPosition
+		);
+		if (!previousClip) return;
+
+		timelineState().cursorPosition = previousClip.startTime;
+		timelineState().movePreviewTo = previousClip.startTime;
+		globalState.getVideoPreviewState.scrollTimelineToCursor();
+	}
+
+	/**
+	 * Planifie le même réalignement WBW qu'après le déplacement d'une borne de sous-titre.
+	 * @returns {void}
+	 */
+	function handleRefetchWbwTimestamps(): void {
+		const clip = globalState.getSubtitleTrack.getCurrentClip(
+			globalState.getTimelineState.cursorPosition
+		);
+		if (!(clip instanceof SubtitleClip)) return;
+
+		scheduleWbwRealign([clip], { reason: 'shortcut' });
+	}
+
+	/**
+	 * Ajuste le zoom de la timeline avec la même logique que la molette.
+	 * @param {number} direction `1` pour zoom in, `-1` pour zoom out.
+	 * @returns {void}
+	 */
+	function adjustTimelineZoom(direction: number): void {
+		const currentZoom = timelineState().zoom;
+
+		if (direction < 0 && currentZoom > 0.2) {
+			timelineState().zoom = currentZoom - 0.75;
+		} else if (direction > 0 && currentZoom < 100) {
+			timelineState().zoom = currentZoom + 0.75;
+		}
+
+		if (timelineState().zoom === 10) {
+			// Valeur interdite qui fait beuguer le rendu
+			timelineState().zoom = 10.01;
+		}
+	}
+
+	// Enregistre le raccourci Backspace pour virer les sous-titres sélectionnés lorsque l'on est dans l'onglet Style
+	function registerRemoveShortcut(): void {
+		if (!globalState.settings || removeShortcutRegistered) return;
+
+		ShortcutService.registerShortcut({
+			key: globalState.settings.shortcuts.SUBTITLES_EDITOR.REMOVE_LAST_SUBTITLE,
+			onKeyDown: handleRemoveSelectedSubtitles
+		});
+
+		removeShortcutRegistered = true;
+	}
+
+	function unregisterRemoveShortcut(): void {
+		if (!removeShortcutRegistered || !globalState.settings) return;
+
+		ShortcutService.unregisterShortcut(
+			globalState.settings.shortcuts.SUBTITLES_EDITOR.REMOVE_LAST_SUBTITLE
+		);
+
+		removeShortcutRegistered = false;
+	}
+
+	function registerSplitShortcut(): void {
+		if (!globalState.settings || splitShortcutRegistered) return;
+
+		// Split shortcut
+		const splitShortcut = globalState.settings.shortcuts.SUBTITLES_EDITOR.SPLIT_SUBTITLE;
+
+		ShortcutService.registerShortcut({
+			key: splitShortcut,
+			onKeyDown: (event) => void handleSplitSubtitle(Boolean(event.ctrlKey || event.metaKey))
+		});
+
+		splitShortcutRegistered = true;
+	}
+
+	function unregisterSplitShortcut(): void {
+		if (!splitShortcutRegistered || !globalState.settings) return;
+
+		const splitShortcut = globalState.settings.shortcuts.SUBTITLES_EDITOR.SPLIT_SUBTITLE;
+
+		ShortcutService.unregisterShortcut(splitShortcut);
+
+		splitShortcutRegistered = false;
+	}
+
+	/**
+	 * Retourne le meilleur sous-titre Quran a editer rapidement depuis la timeline.
+	 * Priorise le sous-titre selectionne dans l'onglet Style, sinon celui sous le curseur,
+	 * sinon le dernier vrai sous-titre du projet.
+	 * @returns {SubtitleClip | null}
+	 */
+	function resolveQuickEditableSubtitleClip(): SubtitleClip | null {
+		if (!globalState.currentProject) return null;
+
+		const selectedSubtitles = globalState.getStylesState.selectedSubtitles;
+		if (selectedSubtitles.length === 1 && selectedSubtitles[0] instanceof SubtitleClip) {
+			return selectedSubtitles[0];
+		}
+
+		const cursorPosition = globalState.getTimelineState.cursorPosition;
+		const clipUnderCursor = globalState.getSubtitleTrack.getCurrentClip(cursorPosition);
+		if (clipUnderCursor instanceof SubtitleClip) {
+			return clipUnderCursor;
+		}
+
+		return globalState.getSubtitleClips.at(-1) ?? null;
+	}
+
+	/**
+	 * Ouvre l'editeur rapide de sous-titre depuis la timeline.
+	 * Priorise le sous-titre selectionne dans l'onglet Style, sinon celui sous le curseur,
+	 * sinon le dernier vrai sous-titre du projet.
+	 * @returns {void}
+	 */
+	function handleOpenQuickSubtitleEditor(): void {
+		const clipToEdit = resolveQuickEditableSubtitleClip();
+		if (!clipToEdit) return;
+		globalState.openQuickTimelineEditor(clipToEdit.id, 'subtitle');
+	}
+
+	/**
+	 * Ouvre l'editeur rapide de timestamps WBW depuis la timeline.
+	 * @returns {void}
+	 */
+	function handleOpenQuickWbwTimestampEditor(): void {
+		const clipToEdit = resolveQuickEditableSubtitleClip();
+		if (!clipToEdit) return;
+
+		globalState.openQuickTimelineEditor(clipToEdit.id, 'wbwTimestamp');
+	}
+
+	const quickSubtitleEditShortcutHandlers = {
+		getTimer: () => quickEditLongPressTimer,
+		setTimer: (timer: ReturnType<typeof setTimeout> | null) => {
+			quickEditLongPressTimer = timer;
+		},
+		getDidTrigger: () => didTriggerQuickLongPressAction,
+		setDidTrigger: (value: boolean) => {
+			didTriggerQuickLongPressAction = value;
+		},
+		onShortPress: () => {
+			handleOpenQuickSubtitleEditor();
+		},
+		onLongPress: () => handleOpenQuickWbwTimestampEditor(),
+		delayMs: 500
+	};
+
+	/**
+	 * Enregistre le raccourci d'ouverture rapide de l'editeur limite de sous-titre.
+	 * @returns {void}
+	 */
+	function registerQuickSubtitleEditShortcut(): void {
+		if (!globalState.settings || quickSubtitleEditShortcutRegistered) return;
+
+		ShortcutService.registerShortcut({
+			key: globalState.settings.shortcuts.SUBTITLES_EDITOR.EDIT_LAST_SUBTITLE,
+			onKeyDown: (event) =>
+				handleManualWordByWordEditShortcutKeyDown(event, quickSubtitleEditShortcutHandlers),
+			onKeyUp: () => handleManualWordByWordEditShortcutKeyUp(quickSubtitleEditShortcutHandlers)
+		});
+
+		quickSubtitleEditShortcutRegistered = true;
+	}
+
+	/**
+	 * Supprime le raccourci d'ouverture rapide de l'editeur limite de sous-titre.
+	 * @returns {void}
+	 */
+	function unregisterQuickSubtitleEditShortcut(): void {
+		if (!quickSubtitleEditShortcutRegistered || !globalState.settings) return;
+
+		ShortcutService.unregisterShortcut(
+			globalState.settings.shortcuts.SUBTITLES_EDITOR.EDIT_LAST_SUBTITLE
+		);
+
+		quickSubtitleEditShortcutRegistered = false;
+	}
+
+	/**
+	 * Ouvre le mode d'édition rapide demandé pour le sous-titre sous le curseur.
+	 * @param {QuickTimelineEditorMode} mode Mode d'édition rapide à ouvrir.
+	 * @returns {void}
+	 */
+	function openQuickEditorForSubtitleAtCursor(mode: QuickTimelineEditorMode): void {
+		const cursorPosition = globalState.getTimelineState.cursorPosition;
+		const clip = globalState.getSubtitleTrack.getCurrentClip(cursorPosition);
+		if (!(clip instanceof SubtitleClip)) return;
+
+		if (mode === 'translation') {
+			globalState.getTranslationsState.isTranslationWbwMappingMode = false;
+			globalState.getTranslationsState.isInlineStyleMode = false;
+		}
+		globalState.openQuickTimelineEditor(clip.id, mode);
+	}
+
+	/**
+	 * Enregistre les quatre raccourcis de l'éditeur rapide au curseur.
+	 * @returns {void}
+	 */
+	function registerQuickEditorShortcuts(): void {
+		if (!globalState.settings || quickEditorShortcutsRegistered) return;
+
+		for (const [action, mode] of Object.entries(quickEditorShortcutModes)) {
+			ShortcutService.registerShortcut({
+				key: globalState.settings.shortcuts.SUBTITLES_EDITOR[
+					action as keyof typeof quickEditorShortcutModes
+				],
+				onKeyDown: () => openQuickEditorForSubtitleAtCursor(mode)
+			});
+		}
+		quickEditorShortcutsRegistered = true;
+	}
+
+	/**
+	 * Supprime les quatre raccourcis de l'éditeur rapide au curseur.
+	 * @returns {void}
+	 */
+	function unregisterQuickEditorShortcuts(): void {
+		if (!globalState.settings || !quickEditorShortcutsRegistered) return;
+
+		for (const action of Object.keys(quickEditorShortcutModes)) {
+			ShortcutService.unregisterShortcut(
+				globalState.settings.shortcuts.SUBTITLES_EDITOR[
+					action as keyof typeof quickEditorShortcutModes
+				]
+			);
+		}
+		quickEditorShortcutsRegistered = false;
+	}
+
+	/**
+	 * Definit la fin du sous-titre actuel (sous le curseur) a la position du curseur.
+	 * Si un sous-titre suivant existe, ajuste son temps de debut a cursorPosition + 1.
+	 * @param {KeyboardEvent} event Raccourci clavier ; Shift transfère aussi les mots.
+	 * @returns {Promise<void>} Résolution après la mise à jour des sous-titres.
+	 */
+	async function handleSetSubtitleEndTime(event: KeyboardEvent): Promise<void> {
+		if (globalState.shared.wbwEdit.active) {
+			moveManualWordByWordSelectedWordEndToCursor();
+			return;
+		}
+
+		const subtitleTrack = globalState.getSubtitleTrack;
+		const cursorPosition = globalState.getTimelineState.cursorPosition;
+
+		// Trouve le sous-titre sous le curseur
+		const currentClip = subtitleTrack.getCurrentClip(cursorPosition);
+
+		if (event.shiftKey) {
+			const resize = currentClip && subtitleTrack.createWordBoundaryResize(currentClip.id, 'end');
+			if (await resize?.(cursorPosition))
+				globalState.currentProject?.detail.updateVideoDetailAttributes();
+			return;
+		}
+
+		if (currentClip) {
+			// Verifie que le curseur est dans une position valide (pas au tout debut du clip)
+			if (cursorPosition <= currentClip.startTime + 50) {
+				return; // Curseur trop proche du debut, ne rien faire
+			}
+
+			// Definit la fin du sous-titre actuel a la position du curseur
+			currentClip.setEndTime(cursorPosition);
+
+			// Trouve le sous-titre suivant et ajuste son temps de debut
+			const nextClip = subtitleTrack.getClipAfter(currentClip.id);
+			if (nextClip) {
+				nextClip.setStartTime(cursorPosition + 1);
+			}
+
+			globalState.currentProject?.detail.updateVideoDetailAttributes();
+			globalState.updateVideoPreviewUI();
+		} else {
+			// Fallback: Si aucun clip sous le curseur, on prend le dernier sous-titre
+			const lastClip = subtitleTrack.getLastClip();
+			if (lastClip) {
+				lastClip.setEndTime(cursorPosition);
+
+				globalState.currentProject?.detail.updateVideoDetailAttributes();
+				globalState.updateVideoPreviewUI();
+			}
+		}
+	}
+
+	/**
+	 * Definit le debut du sous-titre actuel (sous le curseur) a la position du curseur.
+	 * Si un sous-titre precedent existe, ajuste son temps de fin a cursorPosition - 1.
+	 * @param {KeyboardEvent} event Raccourci clavier ; Shift transfère aussi les mots.
+	 * @returns {Promise<void>} Résolution après la mise à jour des sous-titres.
+	 */
+	async function handleSetSubtitleStartTime(event: KeyboardEvent): Promise<void> {
+		if (globalState.shared.wbwEdit.active) {
+			moveManualWordByWordSelectedWordStartToCursor();
+			return;
+		}
+
+		const subtitleTrack = globalState.getSubtitleTrack;
+		const cursorPosition = globalState.getTimelineState.cursorPosition;
+
+		// Trouve le sous-titre sous le curseur
+		const currentClip = subtitleTrack.getCurrentClip(cursorPosition);
+
+		if (event.shiftKey) {
+			const resize = currentClip && subtitleTrack.createWordBoundaryResize(currentClip.id, 'start');
+			if (await resize?.(cursorPosition))
+				globalState.currentProject?.detail.updateVideoDetailAttributes();
+			return;
+		}
+
+		if (currentClip) {
+			// Verifie que le curseur est dans une position valide (pas a la toute fin du clip)
+			if (cursorPosition >= currentClip.endTime - 50) {
+				return; // Curseur trop proche de la fin, ne rien faire
+			}
+
+			// Definit le debut du sous-titre actuel a la position du curseur
+			currentClip.setStartTime(cursorPosition);
+
+			// Trouve le sous-titre precedent et ajuste son temps de fin
+			const previousClip = subtitleTrack.getClipBefore(currentClip.id);
+			if (previousClip) {
+				previousClip.setEndTime(cursorPosition - 1);
+			}
+
+			globalState.currentProject?.detail.updateVideoDetailAttributes();
+			globalState.updateVideoPreviewUI();
+		} else {
+			// Fallback: Si aucun clip sous le curseur, on prend le premier sous-titre
+			const firstClip = subtitleTrack.clips[0];
+			if (firstClip) {
+				firstClip.setStartTime(cursorPosition);
+
+				globalState.currentProject?.detail.updateVideoDetailAttributes();
+				globalState.updateVideoPreviewUI();
+			}
+		}
+	}
+
+	function registerSetEndShortcut(): void {
+		if (!globalState.settings || setEndShortcutRegistered) return;
+
+		ShortcutService.registerShortcut({
+			key: globalState.settings.shortcuts.SUBTITLES_EDITOR.SET_LAST_SUBTITLE_END,
+			onKeyDown: handleSetSubtitleEndTime
+		});
+
+		setEndShortcutRegistered = true;
+	}
+
+	function unregisterSetEndShortcut(): void {
+		if (!setEndShortcutRegistered || !globalState.settings) return;
+
+		ShortcutService.unregisterShortcut(
+			globalState.settings.shortcuts.SUBTITLES_EDITOR.SET_LAST_SUBTITLE_END
+		);
+
+		setEndShortcutRegistered = false;
+	}
+
+	function registerSetStartShortcut(): void {
+		if (!globalState.settings || setStartShortcutRegistered) return;
+
+		ShortcutService.registerShortcut({
+			key: globalState.settings.shortcuts.SUBTITLES_EDITOR.SET_LAST_SUBTITLE_START,
+			onKeyDown: handleSetSubtitleStartTime
+		});
+
+		setStartShortcutRegistered = true;
+	}
+
+	function unregisterSetStartShortcut(): void {
+		if (!setStartShortcutRegistered || !globalState.settings) return;
+
+		ShortcutService.unregisterShortcut(
+			globalState.settings.shortcuts.SUBTITLES_EDITOR.SET_LAST_SUBTITLE_START
+		);
+
+		setStartShortcutRegistered = false;
+	}
+
+	/**
+	 * Enregistre le raccourci clavier pour reculer d'une frame.
+	 * @returns {void}
+	 */
+	function registerFrameBackwardShortcut(): void {
+		if (!globalState.settings || frameBackwardShortcutRegistered) return;
+
+		ShortcutService.registerShortcut({
+			key: globalState.settings.shortcuts.TIMELINE.FRAME_BACKWARD,
+			onKeyDown: handleMoveFrameBackward
+		});
+
+		frameBackwardShortcutRegistered = true;
+	}
+
+	/**
+	 * Supprime le raccourci clavier pour reculer d'une frame.
+	 * @returns {void}
+	 */
+	function unregisterFrameBackwardShortcut(): void {
+		if (!frameBackwardShortcutRegistered || !globalState.settings) return;
+
+		ShortcutService.unregisterShortcut(globalState.settings.shortcuts.TIMELINE.FRAME_BACKWARD);
+
+		frameBackwardShortcutRegistered = false;
+	}
+
+	/**
+	 * Enregistre le raccourci clavier pour avancer d'une frame.
+	 * @returns {void}
+	 */
+	function registerFrameForwardShortcut(): void {
+		if (!globalState.settings || frameForwardShortcutRegistered) return;
+
+		ShortcutService.registerShortcut({
+			key: globalState.settings.shortcuts.TIMELINE.FRAME_FORWARD,
+			onKeyDown: handleMoveFrameForward
+		});
+
+		frameForwardShortcutRegistered = true;
+	}
+
+	/**
+	 * Supprime le raccourci clavier pour avancer d'une frame.
+	 * @returns {void}
+	 */
+	function unregisterFrameForwardShortcut(): void {
+		if (!frameForwardShortcutRegistered || !globalState.settings) return;
+
+		ShortcutService.unregisterShortcut(globalState.settings.shortcuts.TIMELINE.FRAME_FORWARD);
+
+		frameForwardShortcutRegistered = false;
+	}
+
+	/**
+	 * Enregistre le raccourci W de recalcul WBW.
+	 * @returns {void}
+	 */
+	function registerRefetchWbwShortcut(): void {
+		if (!globalState.settings || refetchWbwShortcutRegistered) return;
+
+		ShortcutService.registerShortcut({
+			key: globalState.settings.shortcuts.SUBTITLES_EDITOR.REFETCH_WBW_TIMESTAMPS,
+			onKeyDown: handleRefetchWbwTimestamps
+		});
+
+		refetchWbwShortcutRegistered = true;
+	}
+
+	/**
+	 * Supprime le raccourci W de recalcul WBW.
+	 * @returns {void}
+	 */
+	function unregisterRefetchWbwShortcut(): void {
+		if (!globalState.settings || !refetchWbwShortcutRegistered) return;
+
+		ShortcutService.unregisterShortcut(
+			globalState.settings.shortcuts.SUBTITLES_EDITOR.REFETCH_WBW_TIMESTAMPS
+		);
+		refetchWbwShortcutRegistered = false;
+	}
+
+	/**
+	 * Enregistre le raccourci Delete de suppression du sous-titre au curseur.
+	 * @returns {void}
+	 */
+	function registerRemoveSubtitleAtCursorShortcut(): void {
+		if (!globalState.settings || removeSubtitleAtCursorShortcutRegistered) return;
+
+		ShortcutService.registerShortcut({
+			key: globalState.settings.shortcuts.SUBTITLES_EDITOR.REMOVE_SUBTITLE_AT_CURSOR,
+			onKeyDown: handleRemoveSubtitleAtCursor
+		});
+
+		removeSubtitleAtCursorShortcutRegistered = true;
+	}
+
+	/**
+	 * Supprime le raccourci Delete de suppression du sous-titre au curseur.
+	 * @returns {void}
+	 */
+	function unregisterRemoveSubtitleAtCursorShortcut(): void {
+		if (!globalState.settings || !removeSubtitleAtCursorShortcutRegistered) return;
+
+		ShortcutService.unregisterShortcut(
+			globalState.settings.shortcuts.SUBTITLES_EDITOR.REMOVE_SUBTITLE_AT_CURSOR
+		);
+		removeSubtitleAtCursorShortcutRegistered = false;
+	}
+
+	/**
+	 * Active le bouton de quick merge le plus proche du curseur de timeline.
+	 * @param {KeyboardEvent} event Événement clavier du raccourci.
+	 * @returns {void}
+	 */
+	function handleQuickMergeAtCursor(event: KeyboardEvent): void {
+		if (event.repeat || !timelineTracksDiv) return;
+
+		const cursorPosition = globalState.getTimelineState.cursorPosition;
+		const currentClip = globalState.getSubtitleTrack.getCurrentClip(cursorPosition);
+		if (!(currentClip instanceof SubtitleClip)) return;
+
+		const buttons = Array.from(
+			timelineTracksDiv.querySelectorAll<HTMLButtonElement>('.timeline-quick-merge-button')
+		).filter(
+			(button) =>
+				Number(button.dataset.leftClipId) === currentClip.id ||
+				Number(button.dataset.rightClipId) === currentClip.id
+		);
+		const closestButton = buttons.reduce<HTMLButtonElement | null>((closest, button) => {
+			const position = Number(button.dataset.timelinePositionMs);
+			if (!Number.isFinite(position)) return closest;
+			if (!closest) return button;
+
+			const closestPosition = Number(closest.dataset.timelinePositionMs);
+			return Math.abs(position - cursorPosition) < Math.abs(closestPosition - cursorPosition)
+				? button
+				: closest;
+		}, null);
+
+		const closestPosition = Number(closestButton?.dataset.timelinePositionMs);
+		if (
+			closestButton &&
+			Math.abs(closestPosition - cursorPosition) <=
+				(currentClip.endTime - currentClip.startTime) / 2
+		) {
+			closestButton.click();
+		}
+	}
+
+	/**
+	 * Enregistre le raccourci de quick merge au curseur.
+	 * @returns {void}
+	 */
+	function registerQuickMergeShortcut(): void {
+		if (!globalState.settings || quickMergeShortcutRegistered) return;
+
+		ShortcutService.registerShortcut({
+			key: globalState.settings.shortcuts.TIMELINE.QUICK_MERGE_AT_CURSOR,
+			onKeyDown: handleQuickMergeAtCursor
+		});
+		quickMergeShortcutRegistered = true;
+	}
+
+	/**
+	 * Supprime le raccourci de quick merge au curseur.
+	 * @returns {void}
+	 */
+	function unregisterQuickMergeShortcut(): void {
+		if (!globalState.settings || !quickMergeShortcutRegistered) return;
+
+		ShortcutService.unregisterShortcut(
+			globalState.settings.shortcuts.TIMELINE.QUICK_MERGE_AT_CURSOR
+		);
+		quickMergeShortcutRegistered = false;
+	}
+
+	/**
+	 * Enregistre le raccourci vers le prochain segment marqué.
+	 * @returns {void}
+	 */
+	function registerNextMarkedSegmentShortcut(): void {
+		if (!globalState.settings || nextMarkedSegmentShortcutRegistered) return;
+		ShortcutService.registerShortcut({
+			key: globalState.settings.shortcuts.TIMELINE.NEXT_MARKED_SEGMENT,
+			onKeyDown: handleNextMarkedSegment
+		});
+		nextMarkedSegmentShortcutRegistered = true;
+	}
+
+	/**
+	 * Supprime le raccourci vers le prochain segment marqué.
+	 * @returns {void}
+	 */
+	function unregisterNextMarkedSegmentShortcut(): void {
+		if (!globalState.settings || !nextMarkedSegmentShortcutRegistered) return;
+		ShortcutService.unregisterShortcut(globalState.settings.shortcuts.TIMELINE.NEXT_MARKED_SEGMENT);
+		nextMarkedSegmentShortcutRegistered = false;
+	}
+
+	/**
+	 * Enregistre le raccourci vers le segment marqué précédent.
+	 * @returns {void}
+	 */
+	function registerPreviousMarkedSegmentShortcut(): void {
+		if (!globalState.settings || previousMarkedSegmentShortcutRegistered) return;
+		ShortcutService.registerShortcut({
+			key: globalState.settings.shortcuts.TIMELINE.PREVIOUS_MARKED_SEGMENT,
+			onKeyDown: handlePreviousMarkedSegment
+		});
+		previousMarkedSegmentShortcutRegistered = true;
+	}
+
+	/**
+	 * Supprime le raccourci vers le segment marqué précédent.
+	 * @returns {void}
+	 */
+	function unregisterPreviousMarkedSegmentShortcut(): void {
+		if (!globalState.settings || !previousMarkedSegmentShortcutRegistered) return;
+		ShortcutService.unregisterShortcut(
+			globalState.settings.shortcuts.TIMELINE.PREVIOUS_MARKED_SEGMENT
+		);
+		previousMarkedSegmentShortcutRegistered = false;
+	}
+
+	$effect(() => {
+		const currentTab = globalState.currentProject?.projectEditorState.currentTab;
+
+		// On active le shortcut de split pour tous les onglets
+		registerSplitShortcut();
+
+		// Le raccourci de suppression (Backspace) reste specifique a l'onglet Style pour l'instant
+		// (pour éviter de supprimer par erreur dans d'autres contextes)
+		if (currentTab === ProjectEditorTabs.Style) {
+			registerRemoveShortcut();
+		} else {
+			unregisterRemoveShortcut();
+		}
+
+		if (
+			currentTab === ProjectEditorTabs.VideoEditor ||
+			currentTab === ProjectEditorTabs.SubtitlesEditor ||
+			currentTab === ProjectEditorTabs.Style ||
+			currentTab === ProjectEditorTabs.Export
+		) {
+			registerQuickEditorShortcuts();
+		} else {
+			unregisterQuickEditorShortcuts();
+		}
+
+		if (
+			currentTab === ProjectEditorTabs.VideoEditor ||
+			currentTab === ProjectEditorTabs.Style ||
+			currentTab === ProjectEditorTabs.Export
+		) {
+			registerQuickSubtitleEditShortcut();
+		} else {
+			unregisterQuickSubtitleEditShortcut();
+		}
+
+		// Le raccourci de synchronisation des clips bouclés
+		if (globalState.currentProject) {
+			const timeline = globalState.currentProject.content.timeline;
+			const longestMs = timeline.getLongestTrackDurationIgnoringLoopedVideo().ms;
+
+			const videoTrack = timeline.tracks.find((t) => t.type === TrackType.Video);
+			if (videoTrack) {
+				const loopedClip = videoTrack.clips.find(
+					(clip) => clip instanceof AssetClip && (clip as AssetClip).loopUntilAudioEnd
+				);
+
+				if (loopedClip && loopedClip.endTime !== longestMs) {
+					ProjectHistoryManager.ignore(() => {
+						loopedClip.setEndTime(longestMs);
+					});
+				}
+			}
+		}
+
+		// Le raccourci M pour définir la fin du sous-titre fonctionne dans tous les tabs maintenant
+		registerSetEndShortcut();
+		registerSetStartShortcut();
+		registerFrameBackwardShortcut();
+		registerFrameForwardShortcut();
+
+		registerRefetchWbwShortcut();
+		registerRemoveSubtitleAtCursorShortcut();
+		registerQuickMergeShortcut();
+		registerNextMarkedSegmentShortcut();
+		registerPreviousMarkedSegmentShortcut();
+
+		return () => {
+			unregisterSplitShortcut();
+			unregisterRemoveShortcut();
+			unregisterQuickSubtitleEditShortcut();
+			unregisterQuickEditorShortcuts();
+			unregisterSetEndShortcut();
+			unregisterSetStartShortcut();
+			unregisterFrameBackwardShortcut();
+			unregisterFrameForwardShortcut();
+			unregisterRefetchWbwShortcut();
+			unregisterRemoveSubtitleAtCursorShortcut();
+			unregisterQuickMergeShortcut();
+			unregisterNextMarkedSegmentShortcut();
+			unregisterPreviousMarkedSegmentShortcut();
+		};
+	});
+
+	onMount(() => {
+		// Restitue le scroll
+		if (timelineDiv) {
+			timelineDiv.scrollLeft = timelineState().scrollX;
+		}
+		if (timelineTracksDiv) {
+			timelineTracksDiv.scrollLeft = timelineState().scrollX;
+			tracksViewportWidth = timelineTracksDiv.clientWidth;
+
+			tracksResizeObserver = new ResizeObserver((entries) => {
+				const [entry] = entries;
+				if (!entry) return;
+				tracksViewportWidth = entry.contentRect.width;
+			});
+			tracksResizeObserver.observe(timelineTracksDiv);
+		}
+
+		// Au cas où il serait en false après un changement de taille de sous-titre
+		globalState.getTimelineState.showCursor = true;
+
+		globalState.getVideoPreviewState.scrollTimelineToCursor = scrollTimelineToCursor;
+
+		return () => {
+			tracksResizeObserver?.disconnect();
+			tracksResizeObserver = null;
+		};
+	});
+
+	$effect(() => {
+		const scrollX = timelineState().scrollX;
+		const safeZoom = Math.max(timelineState().zoom, 0.0001);
+		const viewportWidthPx = tracksViewportWidth;
+		const totalDurationMs = totalDuration().ms;
+
+		const viewportStartMs = Math.max(
+			0,
+			((scrollX - TIMELINE_LEFT_HEADER_WIDTH_PX) / safeZoom) * 1000
+		);
+		const viewportEndMs = Math.max(
+			viewportStartMs,
+			((scrollX + viewportWidthPx - TIMELINE_LEFT_HEADER_WIDTH_PX) / safeZoom) * 1000
+		);
+
+		thumbnailRangeStartMs = viewportStartMs;
+		thumbnailRangeEndMs = Math.min(totalDurationMs, viewportEndMs);
+		visibleRangeStartMs = Math.max(0, viewportStartMs - OVERSCAN_MS);
+		visibleRangeEndMs = Math.min(totalDurationMs, viewportEndMs + OVERSCAN_MS);
+	});
+
+	$effect(() => {
+		const cursorPosition = timelineState().cursorPosition;
+		const clipUnderCursor = globalState.getSubtitleTrack?.getCurrentClip(cursorPosition);
+
+		if (
+			!(
+				clipUnderCursor instanceof SubtitleClip || clipUnderCursor instanceof PredefinedSubtitleClip
+			)
+		) {
+			lastVerifiedClipId = null;
+			return;
+		}
+
+		lastVerifiedClipId = clipUnderCursor.id;
+		markClipAsVerified(clipUnderCursor);
+	});
+
+	/**
+	 * Scroll la timeline a la position du curseur
+	 */
+	function scrollTimelineToCursor() {
+		if (!timelineDiv) return;
+		// Calcule la position du curseur en pixels (même formule que le playhead)
+		const cursorPixelPosition =
+			(globalState.getTimelineState.cursorPosition / 1000) * timelineState().zoom + 180;
+		// Centre le curseur dans la vue (soustrait la moitié de la largeur visible)
+		const viewportWidth = timelineDiv.clientWidth;
+		timelineDiv.scrollLeft = Math.max(0, cursorPixelPosition - viewportWidth / 2);
+	}
+
+	// Fonction pour déterminer l'intervalle d'affichage des timestamps selon le zoom
+	function getTimestampInterval(zoom: number): number {
+		if (zoom >= 50) return 1; // Chaque seconde
+		if (zoom >= 30) return 2; // Toutes les 2 secondes
+		if (zoom >= 20) return 5; // Toutes les 5 secondes
+		if (zoom >= 10) return 10; // Toutes les 10 secondes
+		if (zoom >= 5) return 15; // Toutes les 15 secondes
+		if (zoom >= 2) return 30; // Toutes les 30 secondes
+		return 60; // Chaque minute
+	}
+
+	// Fonction pour determiner si on doit afficher un timestamp a cette position
+	function shouldShowTimestamp(secondIndex: number, zoom: number): boolean {
+		const interval = getTimestampInterval(zoom);
+		return secondIndex % interval === 0;
+	}
+
+	function handleTimelineClick(event: MouseEvent) {
+		const target = event.currentTarget as HTMLElement;
+		if (!target) return;
+
+		// Si l'élément est un bouton ou un élément interactif ou son parent direct, on ne fait rien
+		const eventTarget = event.target;
+		if (!(eventTarget instanceof Element)) return;
+		if (
+			eventTarget.closest('.track-left-part') ||
+			(eventTarget instanceof HTMLElement && eventTarget.classList.contains('material-icons'))
+		)
+			return;
+
+		const rect = target.getBoundingClientRect();
+		const clickX = event.clientX - rect.left - 180; // Soustrait la largeur du header
+		const newPosition = Math.max(1, (clickX / timelineState().zoom) * 1000);
+
+		timelineState().cursorPosition = newPosition;
+		timelineState().movePreviewTo = newPosition;
+
+		globalState.getTimelineState.wasCursorDragged = false;
+	}
+
+	function handleTimelineDrag(event: MouseEvent) {
+		if (event.buttons !== 1) return; // Seulement si le bouton gauche est maintenu
+		globalState.getTimelineState.wasCursorDragged = true;
+
+		const target = event.currentTarget as HTMLElement;
+		if (!target) return;
+
+		const eventTarget = event.target;
+		if (eventTarget instanceof Element && eventTarget.closest('.track-left-part')) return;
+
+		const rect = target.getBoundingClientRect();
+		const clickX = event.clientX - rect.left - 180; // Soustrait la largeur du header
+		const newPosition = Math.max(1, (clickX / timelineState().zoom) * 1000);
+
+		timelineState().cursorPosition = newPosition;
+		timelineState().movePreviewTo = newPosition;
+	}
+
+	function handleRulerClick(event: MouseEvent) {
+		const target = event.currentTarget as HTMLElement;
+		if (!target) return;
+
+		const rect = target.getBoundingClientRect();
+		const clickX = event.clientX - rect.left - 180; // Soustrait la largeur du header
+		const newPosition = Math.max(1, (clickX / timelineState().zoom) * 1000);
+
+		timelineState().cursorPosition = newPosition;
+		timelineState().movePreviewTo = newPosition;
+
+		globalState.getTimelineState.wasCursorDragged = false;
+	}
+
+	function handleRulerDrag(event: MouseEvent) {
+		if (event.buttons !== 1) return; // Seulement si le bouton gauche est maintenu
+		globalState.getTimelineState.wasCursorDragged = true;
+
+		const target = event.currentTarget as HTMLElement;
+		if (!target) return;
+
+		const rect = target.getBoundingClientRect();
+		const clickX = event.clientX - rect.left - 180; // Soustrait la largeur du header
+		const newPosition = Math.max(1, (clickX / timelineState().zoom) * 1000);
+
+		timelineState().cursorPosition = newPosition;
+		timelineState().movePreviewTo = newPosition;
+	}
+
+	// Synchronise le scroll entre la règle et les pistes
+	function syncScroll(event: Event) {
+		const source = event.target as HTMLElement;
+		const isRuler = source.classList.contains('timeline-ruler');
+		const isTrack = source.classList.contains('timeline-tracks');
+
+		if (isRuler) {
+			const tracks = source.parentElement?.querySelector('.timeline-tracks') as HTMLElement;
+			if (tracks) tracks.scrollLeft = source.scrollLeft;
+		} else if (isTrack) {
+			const ruler = source.parentElement?.querySelector('.timeline-ruler') as HTMLElement;
+			if (ruler) ruler.scrollLeft = source.scrollLeft;
+		}
+
+		// Sauvegarde le scroll dans les paramètres de la timeline
+		timelineState().scrollX = source.scrollLeft;
+	}
+
+	/**
+	 * Vérifie si une option de raccourci timeline correspond à l'événement de molette.
+	 * @param {string} shortcut Option de raccourci enregistrée.
+	 * @param {WheelEvent} event Événement de molette courant.
+	 * @returns {boolean} `true` si l'option correspond aux touches maintenues.
+	 */
+	function matchesTimelineWheelShortcut(shortcut: string, event: WheelEvent): boolean {
+		if (shortcut === 'scroll') return !event.ctrlKey && !event.shiftKey && !event.altKey;
+		if (shortcut === 'control') return event.ctrlKey && !event.shiftKey && !event.altKey;
+		if (shortcut === 'shift') return !event.ctrlKey && event.shiftKey && !event.altKey;
+		if (shortcut === 'control+shift') return event.ctrlKey && event.shiftKey && !event.altKey;
+		if (shortcut === 'alt') return !event.ctrlKey && !event.shiftKey && event.altKey;
+		return false;
+	}
+
+	/**
+	 * Vérifie si une action timeline est déclenchée par l'événement de molette.
+	 * @param {keyof Settings['shortcuts']['TIMELINE']} action Action timeline à tester.
+	 * @param {WheelEvent} event Événement de molette courant.
+	 * @returns {boolean} `true` si au moins une option enregistrée correspond.
+	 */
+	function isTimelineWheelAction(
+		action: keyof Settings['shortcuts']['TIMELINE'],
+		event: WheelEvent
+	): boolean {
+		const shortcuts = globalState.settings?.shortcuts.TIMELINE[action].keys ?? [];
+		return shortcuts.some((shortcut) => matchesTimelineWheelShortcut(shortcut, event));
+	}
+
+	function handleMouseWheelWheeling(event: WheelEvent) {
+		if (
+			(event.deltaX !== 0 && Math.abs(event.deltaX) > Math.abs(event.deltaY)) ||
+			isTimelineWheelAction('HORIZONTAL_SCROLL', event)
+		) {
+			const eventTarget = event.target;
+			if (!(eventTarget instanceof Element)) return;
+
+			const scrollTarget = eventTarget.closest('.timeline-ruler')
+				? timelineDiv
+				: eventTarget.closest('.timeline-tracks')
+					? timelineTracksDiv
+					: (timelineTracksDiv ?? timelineDiv);
+
+			if (!scrollTarget) return;
+
+			event.preventDefault();
+			scrollTarget.scrollLeft += event.deltaX || event.deltaY;
+			return;
+		}
+
+		if (isTimelineWheelAction('ZOOM', event)) {
+			adjustTimelineZoom(event.deltaY > 0 ? -1 : 1);
+
+			return;
+		}
+
+		if (
+			isTimelineWheelAction('FRAME_BY_FRAME_SCROLL', event) &&
+			!globalState.getVideoPreviewState.isPlaying
+		) {
+			event.preventDefault();
+			const direction = event.deltaY > 0 ? 1 : -1;
+			moveCursorByFrame(direction);
+
+			return;
+		}
+
+		if (!isTimelineWheelAction('VERTICAL_SCROLL', event)) return;
+
+		event.preventDefault();
+		if (timelineTracksDiv) {
+			timelineTracksDiv.scrollTop += event.deltaY;
+		}
+	}
+
+	async function dismissTimelineWheelHints(): Promise<void> {
+		if (!globalState.settings) return;
+		globalState.settings.persistentUiState.showTimelineWheelHints = false;
+		await Settings.save();
+	}
+
+	/**
+	 * Déplace une piste dans l'ordre d'affichage global de la timeline.
+	 * @param {Track} track Piste à déplacer.
+	 * @param {number} direction Direction du déplacement (`-1` vers le haut, `1` vers le bas).
+	 * @returns {Promise<void>}
+	 */
+	async function moveTimelineTrack(track: Track, direction: number): Promise<void> {
+		const settings = globalState.settings;
+		if (!settings) return;
+
+		const visibleTracks = orderedTrackItems();
+		const displayIndex = visibleTracks.findIndex((item) => item.track === track);
+		const swapTarget = visibleTracks[displayIndex + direction]?.track;
+		if (!swapTarget) return;
+
+		const allTypes = globalState.currentProject!.content.timeline.tracks.map((item) => item.type);
+		const savedOrder = settings.persistentUiState.timelineTrackOrder.filter((type) =>
+			allTypes.includes(type)
+		);
+		const order = [...savedOrder, ...allTypes.filter((type) => !savedOrder.includes(type))];
+		const trackIndex = order.indexOf(track.type);
+		const targetIndex = order.indexOf(swapTarget.type);
+		if (trackIndex === -1 || targetIndex === -1) return;
+
+		[order[trackIndex], order[targetIndex]] = [order[targetIndex], order[trackIndex]];
+		settings.persistentUiState.timelineTrackOrder = order;
+		await Settings.save();
+	}
+
+	onDestroy(() => {
+		unregisterSplitShortcut();
+		unregisterRemoveShortcut();
+		unregisterQuickSubtitleEditShortcut();
+		unregisterSetEndShortcut();
+		unregisterSetStartShortcut();
+		unregisterFrameBackwardShortcut();
+		unregisterFrameForwardShortcut();
+		unregisterRefetchWbwShortcut();
+		unregisterRemoveSubtitleAtCursorShortcut();
+		unregisterQuickMergeShortcut();
+		tracksResizeObserver?.disconnect();
+		tracksResizeObserver = null;
+	});
+</script>
+
+<section
+	dir="ltr"
+	class="overflow-hidden min-w-0 timeline-section flex-1 min-h-0"
+	style="height: {100 -
+		globalState.settings!.persistentUiState.projectEditorLayout.upperSectionHeight}%;"
+>
+	<div class="timeline-container select-none" onwheel={handleMouseWheelWheeling}>
+		<!-- Timeline Header -->
+		<div class="timeline-ruler" onscroll={syncScroll} bind:this={timelineDiv}>
+			<div
+				class="ruler-content"
+				style="width: {totalDuration().toSeconds() * timelineState().zoom + 180}px;"
+				onclick={handleRulerClick}
+				onmousemove={handleRulerDrag}
+				role="button"
+				tabindex="0"
+			>
+				<!-- Header spacer for alignment -->
+				<div class="ruler-header-spacer">
+					<div class="ruler-zoom-controls">
+						<button
+							class="ruler-zoom-button"
+							type="button"
+							title="Zoom out"
+							aria-label="Zoom out"
+							onclick={(event) => {
+								event.stopPropagation();
+								adjustTimelineZoom(-1);
+							}}
+						>
+							<span class="material-icons-outlined text-[18px]!">zoom_out</span>
+						</button>
+						<button
+							class="ruler-zoom-button"
+							type="button"
+							title="Zoom in"
+							aria-label="Zoom in"
+							onclick={(event) => {
+								event.stopPropagation();
+								adjustTimelineZoom(1);
+							}}
+						>
+							<span class="material-icons-outlined text-[18px]!">zoom_in</span>
+						</button>
+					</div>
+				</div>
+
+				<!-- Time markers -->
+				{#each visibleSeconds() as i (i)}
+					{#if shouldShowTimestamp(i, timelineState().zoom)}
+						<div
+							class="time-marker"
+							class:major={getTimestampInterval(timelineState().zoom) >= 10 &&
+								i % (getTimestampInterval(timelineState().zoom) * 2) === 0}
+							style="left: {i * timelineState().zoom + 180}px;"
+						>
+							<div class="time-label z-5">
+								{new Duration(i * 1000).getFormattedTime(true)}
+							</div>
+							<div class="time-tick"></div>
+						</div>
+					{/if}
+				{/each}
+
+				<TimelineKeyframeMarkers
+					times={globalState.getAllStyleKeyframeTimes()}
+					zoom={timelineState().zoom}
+					offset={TIMELINE_LEFT_HEADER_WIDTH_PX}
+				/>
+
+				<!-- Playhead cursor in ruler -->
+				<div
+					class="playhead-ruler"
+					style="left: {(timelineState().cursorPosition / 1000) * timelineState().zoom +
+						180}px; opacity: {timelineState().showCursor ? 1 : 0};"
+				>
+					<div class="playhead-handle"></div>
+				</div>
+			</div>
+		</div>
+
+		<!-- Timeline Tracks Area -->
+		<div class="timeline-tracks" onscroll={syncScroll} id="timeline" bind:this={timelineTracksDiv}>
+			<div
+				class="tracks-content grid outline-none"
+				style="width: {totalDuration().toSeconds() * timelineState().zoom + 180}px;"
+				onclick={handleTimelineClick}
+				onmousemove={handleTimelineDrag}
+				role="button"
+				tabindex="0"
+			>
+				<!-- Background grid -->
+				<div class="timeline-grid">
+					{#each visibleSeconds() as i (i)}
+						<div
+							class="grid-line"
+							class:major={shouldShowTimestamp(i, timelineState().zoom)}
+							style="left: {i * timelineState().zoom + 180}px;"
+						></div>
+					{/each}
+				</div>
+
+				<!-- Track lanes -->
+				<div class="track-lanes">
+					{#each orderedTrackItems() as { track, index }, displayIndex (track.type)}
+						<TrackComponent
+							bind:track={globalState.currentProject!.content.timeline.tracks[index]}
+							{visibleRangeStartMs}
+							{visibleRangeEndMs}
+							{thumbnailRangeStartMs}
+							{thumbnailRangeEndMs}
+							canMoveUp={displayIndex > 0}
+							canMoveDown={displayIndex < orderedTrackItems().length - 1}
+							onMoveUp={() => void moveTimelineTrack(track, -1)}
+							onMoveDown={() => void moveTimelineTrack(track, 1)}
+						/>
+					{/each}
+				</div>
+
+				<!-- Main playhead cursor -->
+				<div
+					class="playhead-cursor"
+					id="cursor"
+					style="left: {(timelineState().cursorPosition / 1000) * timelineState().zoom +
+						180}px; opacity: {timelineState().showCursor ? 1 : 0};"
+				></div>
+
+				<!-- Export range overlay when in Export tab -->
+				{#if globalState.currentProject!.projectEditorState.currentTab === ProjectEditorTabs.Export}
+					<div
+						class="export-range-overlay"
+						style="left: {(globalState.getExportState.videoStartTime / 1000) *
+							timelineState().zoom +
+							180}px; 
+							   width: {((globalState.getExportState.videoEndTime - globalState.getExportState.videoStartTime) /
+							1000) *
+							timelineState().zoom}px;"
+					></div>
+					<div
+						class="export-range-border export-start"
+						style="left: {(globalState.getExportState.videoStartTime / 1000) *
+							timelineState().zoom +
+							180}px;"
+					></div>
+					<div
+						class="export-range-border export-end"
+						style="left: {(globalState.getExportState.videoEndTime / 1000) * timelineState().zoom +
+							180}px;"
+					></div>
+					{#each globalState.getExportState.skipRanges ?? [] as range}
+						<div
+							class="skip-range-overlay"
+							style="left: {(range.startTime / 1000) * timelineState().zoom + 180}px;
+								width: {(Math.max(0, range.endTime - range.startTime) / 1000) * timelineState().zoom}px;"
+						></div>
+						<div
+							class="skip-range-border skip-start"
+							style="left: {(range.startTime / 1000) * timelineState().zoom + 180}px;"
+						></div>
+						<div
+							class="skip-range-border skip-end"
+							style="left: {(range.endTime / 1000) * timelineState().zoom + 180}px;"
+						></div>
+					{/each}
+				{/if}
+			</div>
+		</div>
+
+		{#if globalState.shared.quickTimelineEditor.active}
+			<QuickTimelineEditorOverlay />
+		{/if}
+		<div
+			class="subtitle-resize-hint hidden absolute bottom-5 left-[188px] right-2 z-50 w-fit max-w-[calc(100%-196px)] rounded-md bg-white px-3 py-2 text-xs text-black shadow-md pointer-events-none"
+		>
+			{Reflect.get($LL.editor, 'subtitleResizeShiftHint')()}
+		</div>
+	</div>
+</section>
+
+{#if globalState.settings?.persistentUiState.showTimelineWheelHints ?? true}
+	<div
+		class="fixed right-0 bottom-0 z-[1200] text-[10px] leading-[1.2] text-thirdly bg-secondary opacity-40 border border-color rounded-tl-md px-2 pb-2 pt-1 pointer-events-auto select-none backdrop-blur-[4px] hover:opacity-100 transition-opacity duration-150"
+		aria-hidden="true"
+	>
+		<button
+			class="absolute right-1 top-0 text-[15px] bg-primary leading-none text-thirdly hover:text-primary pointer-events-auto"
+			type="button"
+			onclick={dismissTimelineWheelHints}
+			aria-label="Dismiss timeline wheel hints"
+		>
+			×
+		</button>
+		<div>Ctrl + Scroll = Zoom</div>
+		<div>Ctrl + Shift + Scroll = Horizontal Scroll</div>
+		<div>Scroll = Vertical Scroll</div>
+		<div>Alt + Scroll = Frame-by-frame Cursor</div>
+	</div>
+{/if}
+
+<style>
+	.timeline-container:has(:global([data-resizing-without-shift='true'])) .subtitle-resize-hint {
+		display: block;
+	}
+
+	.timeline-container {
+		display: flex;
+		flex-direction: column;
+		height: 100%;
+		background: var(--timeline-bg-primary);
+		border-top: 1px solid var(--border-color);
+		position: relative;
+	}
+
+	/* Timeline Ruler */
+	.timeline-ruler {
+		height: 20px;
+		background: var(--timeline-ruler-bg);
+		border-bottom: 1px solid var(--timeline-track-border);
+		overflow-x: auto;
+		overflow-y: hidden;
+		position: relative;
+		z-index: 10;
+	}
+
+	.ruler-content {
+		height: 100%;
+		position: relative;
+		min-width: 100%;
+		cursor: crosshair;
+	}
+
+	.ruler-header-spacer {
+		position: absolute;
+		left: 0;
+		top: 0;
+		width: 180px;
+		height: 100%;
+		background: var(--timeline-ruler-bg);
+		border-right: 1px solid var(--timeline-track-border);
+		z-index: 5;
+		pointer-events: auto;
+	}
+
+	.ruler-zoom-controls {
+		position: absolute;
+		left: 4px;
+		top: 50%;
+		transform: translateY(-50%);
+		display: flex;
+		gap: 2px;
+		z-index: 6;
+	}
+
+	.ruler-zoom-button {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		color: var(--text-secondary);
+		transition:
+			color 0.15s ease,
+			background-color 0.15s ease,
+			border-color 0.15s ease;
+	}
+
+	.ruler-zoom-button:hover {
+		color: var(--text-primary);
+		background: var(--bg-primary);
+		border-color: var(--accent);
+	}
+
+	.ruler-zoom-button:active {
+		transform: translateY(1px);
+	}
+
+	.time-marker {
+		position: absolute;
+		top: 0;
+		height: 100%;
+		pointer-events: none;
+	}
+
+	.time-label {
+		position: absolute;
+		top: 2px;
+		left: 0;
+		transform: translateX(-50%);
+		font-size: 10px;
+		font-weight: 500;
+		color: var(--timeline-timestamp);
+		font-family: 'JetBrains Mono', 'SF Mono', 'Monaco', 'Cascadia Code', monospace;
+		text-shadow: 0 1px 2px rgba(0, 0, 0, 0.5);
+		white-space: nowrap;
+	}
+
+	.time-marker.major .time-label {
+		color: var(--timeline-timestamp-major);
+		font-weight: 600;
+		font-size: 11px;
+	}
+
+	.time-tick {
+		position: absolute;
+		bottom: 0;
+		left: 0;
+		width: 1px;
+		height: 8px;
+		background: var(--timeline-grid-minor);
+		transform: translateX(-50%);
+	}
+
+	.time-marker.major .time-tick {
+		height: 12px;
+		width: 2px;
+		background: var(--timeline-grid-major);
+		box-shadow: 0 0 4px rgba(88, 166, 255, 0.3);
+	}
+
+	/* Playhead in ruler */
+	.playhead-ruler {
+		position: absolute;
+		top: 0;
+		bottom: 0;
+		width: 2px;
+		background: var(--timeline-cursor);
+		box-shadow: 0 0 8px var(--timeline-cursor-shadow);
+		z-index: 20;
+		pointer-events: none;
+	}
+
+	.playhead-handle {
+		position: absolute;
+		top: -2px;
+		left: -6px;
+		width: 14px;
+		height: 8px;
+		background: var(--timeline-cursor);
+		clip-path: polygon(0 0, 100% 0, 50% 100%);
+		box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
+	}
+
+	/* Timeline Tracks */
+	.timeline-tracks {
+		flex: 1;
+		overflow-x: auto;
+		overflow-y: auto;
+		background: var(--timeline-bg-secondary);
+	}
+
+	.tracks-content {
+		min-height: calc(100% - 4px);
+		position: relative;
+		cursor: crosshair;
+	}
+
+	/* Timeline Grid */
+	.timeline-grid {
+		position: absolute;
+		top: 0;
+		left: 0;
+		right: 0;
+		bottom: 0;
+		pointer-events: none;
+	}
+
+	.grid-line {
+		position: absolute;
+		top: 0;
+		bottom: 0;
+		width: 1px;
+		background: var(--timeline-grid-minor);
+		opacity: 0.5;
+	}
+
+	.grid-line.major {
+		width: 1px;
+		background: var(--timeline-grid-major);
+		opacity: 0.8;
+	}
+	/* Track Lanes */
+	.track-lanes {
+		position: relative;
+		z-index: 1;
+		display: flex;
+		flex-direction: column;
+	}
+
+	/* Main Playhead Cursor */
+	.playhead-cursor {
+		position: absolute;
+		top: 0;
+		bottom: 0;
+		width: 2px;
+		background: var(--timeline-cursor);
+		box-shadow:
+			0 0 8px var(--timeline-cursor-shadow),
+			0 0 16px rgba(248, 81, 73, 0.2);
+		z-index: 100;
+		pointer-events: none;
+	}
+
+	.playhead-cursor::before {
+		content: '';
+		position: absolute;
+		bottom: -4px;
+		left: -6px;
+		width: 14px;
+		height: 8px;
+		background: var(--timeline-cursor);
+		clip-path: polygon(50% 0, 0 100%, 100% 100%);
+		box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
+	}
+
+	/* Synchronize scroll between ruler and tracks */
+	.timeline-ruler::-webkit-scrollbar {
+		display: none;
+	}
+
+	/* Export Range Visualization */
+	.export-range-overlay {
+		position: absolute;
+		top: 0;
+		bottom: 0;
+		background: rgba(34, 197, 94, 0.3);
+		border: 1px solid rgba(34, 197, 94, 0.4);
+		border-radius: 4px;
+		z-index: 0;
+		pointer-events: none;
+	}
+
+	.export-range-border {
+		position: absolute;
+		top: 0;
+		bottom: 0;
+		width: 3px;
+		background: #22c55e;
+		z-index: 0;
+		pointer-events: none;
+		box-shadow: 0 0 8px rgba(34, 197, 94, 0.5);
+	}
+
+	.export-range-border.export-start {
+		border-radius: 3px 0 0 3px;
+	}
+
+	.export-range-border.export-end {
+		border-radius: 0 3px 3px 0;
+		margin-left: -3px;
+	}
+
+	.export-range-border::after {
+		content: '';
+		position: absolute;
+		top: -6px;
+		left: -3px;
+		width: 9px;
+		height: 12px;
+		background: #22c55e;
+		clip-path: polygon(0 0, 100% 0, 50% 100%);
+		box-shadow: 0 2px 6px rgba(34, 197, 94, 0.4);
+	}
+
+	.skip-range-overlay {
+		position: absolute;
+		top: 0;
+		bottom: 0;
+		background: rgba(168, 85, 247, 0.28);
+		border: 1px solid rgba(168, 85, 247, 0.55);
+		border-radius: 4px;
+		z-index: 1;
+		pointer-events: none;
+	}
+
+	.skip-range-border {
+		position: absolute;
+		top: 0;
+		bottom: 0;
+		width: 3px;
+		background: #a855f7;
+		z-index: 1;
+		pointer-events: none;
+		box-shadow: 0 0 8px rgba(168, 85, 247, 0.65);
+	}
+
+	.skip-range-border.skip-end {
+		margin-left: -3px;
+	}
+
+	.skip-range-border::after {
+		content: '';
+		position: absolute;
+		top: -6px;
+		left: -3px;
+		width: 9px;
+		height: 12px;
+		background: #a855f7;
+		clip-path: polygon(0 0, 100% 0, 50% 100%);
+		box-shadow: 0 2px 6px rgba(168, 85, 247, 0.5);
+	}
+</style>

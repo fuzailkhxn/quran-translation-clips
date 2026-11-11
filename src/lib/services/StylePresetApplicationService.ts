@@ -1,0 +1,143 @@
+import type { ProjectContent } from '$lib/classes/ProjectContent.svelte';
+import type {
+	StyleName,
+	StylesData,
+	VideoStyle,
+	VideoStyleFileData
+} from '$lib/classes/VideoStyle.svelte';
+import { getCustomStyleClips, importCustomStyleClips } from './ProjectStyleContentService';
+import { getOverlayLayerOrder } from './OverlayLayerService';
+
+type ApplyStylePresetOptions = {
+	videoStyle: VideoStyle;
+	projectContent: ProjectContent;
+	data: VideoStyleFileData;
+	translationAssignments?: Record<string, string>;
+};
+
+/**
+ * Retourne les cibles de traduction disponibles dans un preset.
+ * @param {VideoStyleFileData} data Données de preset existantes.
+ * @returns {string[]} Identifiants de traductions disponibles.
+ */
+export function getPresetTranslationTargets(data: VideoStyleFileData): string[] {
+	const styles = Array.isArray(data.videoStyle.styles) ? data.videoStyle.styles : [];
+	return styles.flatMap((candidate) => {
+		if (!candidate || typeof candidate !== 'object') return [];
+		const target = (candidate as { target?: unknown }).target;
+		return typeof target === 'string' && target !== 'arabic' && target !== 'global' ? [target] : [];
+	});
+}
+
+/**
+ * Applique un preset de manière déterministe à un projet explicite.
+ * @param {ApplyStylePresetOptions} options Projet, styles et affectations à appliquer.
+ * @returns {Promise<void>} Promesse résolue après la mise à niveau du schéma.
+ */
+export async function applyStylePresetToProject(options: ApplyStylePresetOptions): Promise<void> {
+	const preservedStyleIds: StyleName[] = [
+		'video-clip-transition',
+		'video-clip-transition-duration',
+		'media-position-x',
+		'media-position-y',
+		'media-rotation',
+		'media-scale'
+	];
+	const previousGlobalStyles = options.videoStyle.styles.find(
+		(styles) => styles.target === 'global'
+	);
+	const videoStyleConstructor = options.videoStyle.constructor as unknown as {
+		fromJSON(data: Record<string, unknown>): VideoStyle;
+	};
+	const imported = videoStyleConstructor.fromJSON(options.data.videoStyle);
+	const projectTranslations = options.projectContent.projectTranslation.addedTranslationEditions;
+
+	for (const importedStyles of imported.styles) {
+		if (importedStyles.target === 'arabic' || importedStyles.target === 'global') {
+			replaceTargetStyles(options.videoStyle, importedStyles.target, importedStyles);
+			continue;
+		}
+		if (projectTranslations.some((translation) => translation.name === importedStyles.target)) {
+			replaceTargetStyles(options.videoStyle, importedStyles.target, importedStyles);
+		}
+	}
+
+	for (const [target, source] of Object.entries(options.translationAssignments ?? {})) {
+		const sourceStyles = imported.styles.find((styles) => styles.target === source);
+		if (!sourceStyles) continue;
+		const stylesConstructor = sourceStyles.constructor as unknown as {
+			fromJSON(data: Record<string, unknown>): StylesData;
+		};
+		const copied = stylesConstructor.fromJSON(
+			JSON.parse(JSON.stringify(sourceStyles)) as Record<string, unknown>
+		);
+		copied.target = target;
+		replaceTargetStyles(options.videoStyle, target, copied);
+	}
+
+	const customClips = options.data.customClips?.length
+		? options.data.customClips
+		: (options.data.customTextClips ?? []);
+	const existingCustomCount = getCustomStyleClips(options.projectContent).length;
+	importCustomStyleClips(options.projectContent, customClips);
+	const importedCustomClips = getCustomStyleClips(options.projectContent).slice(
+		existingCustomCount
+	);
+	await options.videoStyle.ensureStylesSchemaUpToDate(options.projectContent);
+	const presetOrder = Array.isArray(options.data.overlayLayerOrder)
+		? options.data.overlayLayerOrder.flatMap((id) => {
+				if (typeof id !== 'string') return [];
+				if (id.startsWith('custom:')) {
+					const clip =
+						importedCustomClips[customClips.findIndex((raw) => `custom:${raw.id}` === id)];
+					return clip ? [`custom:${clip.id}`] : [];
+				}
+				const targets = projectTranslations
+					.filter(
+						(edition) =>
+							edition.name === id || options.translationAssignments?.[edition.name] === id
+					)
+					.map((edition) => edition.name);
+				return targets.length ? targets : [id];
+			})
+		: [];
+	options.projectContent.overlayLayerOrder = getOverlayLayerOrder(
+		options.projectContent,
+		presetOrder
+	);
+	const globalStyles = options.videoStyle.styles.find((styles) => styles.target === 'global');
+	if (previousGlobalStyles && globalStyles) {
+		for (const id of preservedStyleIds) {
+			const previous = previousGlobalStyles.findStyle(id);
+			const current = globalStyles.findStyle(id);
+			if (previous && current) {
+				current.value = previous.value;
+				current.keyframes = previous.keyframes;
+			}
+			for (const key of ['overrides', 'overrideKeyframes'] as const) {
+				const clipIds = new Set([
+					...Object.keys(previousGlobalStyles[key]),
+					...Object.keys(globalStyles[key])
+				]);
+				for (const clipId of clipIds) {
+					const value = previousGlobalStyles[key][Number(clipId)]?.[id];
+					if (value === undefined) delete globalStyles[key][Number(clipId)]?.[id];
+					else (globalStyles[key][Number(clipId)] ??= {})[id] = value;
+				}
+			}
+		}
+	}
+}
+
+/**
+ * Remplace ou ajoute les styles d'une cible sans modifier le format persistant.
+ * @param {VideoStyle} videoStyle Aggregate de styles cible.
+ * @param {string} target Cible à remplacer.
+ * @param {StylesData} styles Nouvelles valeurs.
+ * @returns {void}
+ */
+function replaceTargetStyles(videoStyle: VideoStyle, target: string, styles: StylesData): void {
+	const index = videoStyle.styles.findIndex((candidate) => candidate.target === target);
+	if (index === -1) videoStyle.styles.push(styles);
+	else videoStyle.styles[index] = styles;
+}

@@ -1,0 +1,510 @@
+import { globalState } from '$lib/runes/main.svelte';
+import { canonicalizePredefinedSubtitleType } from './Clip.svelte';
+import type { Edition } from './Edition';
+import type { Project } from './Project';
+import { TrackType } from './enums';
+import { PredefinedSubtitleClip, SubtitleClip } from './Clip.svelte';
+import { SerializableBase } from './misc/SerializableBase';
+import { PredefinedSubtitleTranslation, VerseTranslation } from './Translation.svelte';
+import ModalManager from '$lib/components/modals/ModalManager';
+import LL from '$lib/i18n/i18n-svelte';
+import { get } from 'svelte/store';
+import { QdcTranslationService } from '$lib/services/QdcTranslationService';
+
+type TranslationEditionsResponse = Record<string, unknown>;
+type PunctuationVerseItem = [number, string];
+type SaheehVerseItem = { surah: number; ayah: number; verse: string };
+type SaheehResponse = { quran?: { 'en.sahih'?: Record<string, SaheehVerseItem> } };
+type StandardSurahVerse = { verse: number; text: string };
+type StandardSurahResponse = { chapter?: StandardSurahVerse[] };
+
+export class ProjectTranslation extends SerializableBase {
+	private TEXT_NO_TRANSLATION_AVAILABLE = 'No translation found';
+
+	// Liste des traductions ajoutées au projet
+	addedTranslationEditions: Edition[];
+
+	// Contient les traductions originales du Coran utilisées dans le projet
+	versesTranslations: {
+		[key: string]: { [key: string]: string }; // Clé: édition, Valeur: { clé du verset: texte de la traduction }
+	};
+
+	constructor() {
+		super();
+		this.addedTranslationEditions = $state([]);
+		this.versesTranslations = $state({});
+	}
+
+	/**
+	 * Charge dans la mémoire les traductions disponibles
+	 */
+	static async loadAvailableTranslations() {
+		// Regarde si les traductions sont déjà chargées
+		if (Object.keys(globalState.availableTranslations).length > 0) {
+			return;
+		}
+
+		// Charge les traductions disponibles
+		const object = (await (
+			await fetch('/translations/editions.json')
+		).json()) as TranslationEditionsResponse;
+
+		globalState.availableTranslations = object as typeof globalState.availableTranslations;
+	}
+
+	getVerseTranslation(edition: Edition, verseKey: string): string {
+		return this.versesTranslations[edition.name]?.[verseKey] || this.TEXT_NO_TRANSLATION_AVAILABLE;
+	}
+
+	/**
+	 * Récupère la traduction d'un verset spécifique dans une édition donnée
+	 * @param surah Le numéro de la sourate
+	 * @param verse Le numéro du verset
+	 * @param edition L'édition de traduction à utiliser
+	 * @returns La traduction ou 'No translation found' si non trouvée
+	 */
+	async downloadVerseTranslation(edition: Edition, surah: number, verse: number): Promise<string> {
+		// Regarde si la traduction est déjà dans le cache
+		const cacheKey = `${edition.name}_${surah}_${verse}`;
+		const cached = globalState.caches.get(cacheKey);
+		if (cached) return cached;
+
+		// Récupère l'édition de traduction par son nom
+		if (!edition) return this.TEXT_NO_TRANSLATION_AVAILABLE;
+
+		// Load les traductions de toute la sourate si pas déjà chargée
+		await this.loadSurahTranslation(edition, surah);
+
+		// Construit l'URL de la traduction
+		const cachedAfterLoad = globalState.caches.get(cacheKey);
+		return cachedAfterLoad || this.TEXT_NO_TRANSLATION_AVAILABLE;
+	}
+
+	/**
+	 * Load la traduction de tout les versets d'une sourate pour une édition donnée
+	 */
+	private async loadSurahTranslation(edition: Edition, surah: number): Promise<void> {
+		// Check if we already have some verses from this surah cached
+		const surahCacheKey = `${edition.name}_${surah}_loaded`;
+		if (globalState.caches.has(surahCacheKey)) {
+			return; // Already loaded
+		}
+
+		try {
+			const verses = QdcTranslationService.isQdcEdition(edition)
+				? await QdcTranslationService.getSurahTranslationVerses(edition, surah)
+				: await this.loadLegacySurahTranslation(edition, surah);
+
+			// Cache all verses from the surah
+			for (const verseData of verses) {
+				const cacheKey = `${edition.name}_${surah}_${verseData.verse}`;
+				const processedText = this.processTranslationText(verseData.text, edition);
+				globalState.caches.set(cacheKey, processedText);
+			}
+
+			// Mark this surah as loaded
+			globalState.caches.set(surahCacheKey, 'loaded');
+		} catch (error) {
+			console.error('Error loading surah translation:', error);
+		}
+	}
+
+	/**
+	 * Charge la traduction d'une sourate
+	 */
+	private async loadLegacySurahTranslation(
+		edition: Edition,
+		surah: number
+	): Promise<Array<{ verse: number; text: string }>> {
+		// Build URL for the entire surah
+		const url = this.buildSurahUrl(edition, surah);
+		const response = await fetch(url);
+
+		if (!response.ok) {
+			return [];
+		}
+
+		const data = await response.json();
+		return this.extractSurahFromResponse(data, surah, edition);
+	}
+
+	/**
+	 * Build URL for entire surah translation
+	 */
+	private buildSurahUrl(edition: Edition, surah: number): string {
+		// Si l'édition fait partie des 5 traductions prises via une autre API (pour les poncutations en fin de verset)
+		if (edition.comments === 'Ponctuation') {
+			return edition.link.replace('{chapter}', surah.toString());
+		}
+
+		// Si l'édition fait partie d'une demande spéciale (saheeh international)
+		if (edition.comments === 'Saheeh International') {
+			return edition.link;
+		}
+
+		// Pour les éditions normales, on prend juste la sourate complète
+		const baseUrl = edition.link.replace('.json', '');
+		return `${baseUrl}/${surah}.json`;
+	}
+
+	/**
+	 * Extract all verses from a surah response
+	 */
+	private extractSurahFromResponse(
+		data: unknown,
+		surah: number,
+		edition: Edition
+	): Array<{ verse: number; text: string }> {
+		if (edition.comments === 'Ponctuation') {
+			// Format: array with verse index as key
+			const verses = [];
+			const punctuationData = Array.isArray(data)
+				? (data as Array<PunctuationVerseItem | undefined>)
+				: [];
+			for (let i = 1; i < punctuationData.length; i++) {
+				const item = punctuationData[i];
+				if (item && typeof item[1] === 'string') {
+					verses.push({ verse: i, text: item[1] });
+				}
+			}
+			return verses;
+		} else if (edition.comments === 'Saheeh International') {
+			// Format: nested object structure
+			const verses = [];
+			const saheehData = (data as SaheehResponse).quran?.['en.sahih'] ?? {};
+			for (const key in saheehData) {
+				const item = saheehData[key];
+				if (item.surah === surah) {
+					verses.push({ verse: item.ayah, text: item.verse });
+				}
+			}
+			return verses;
+		} else {
+			// Format standard: { "chapter": [{"chapter": 1, "verse": 1, "text": "..."}, ...] }
+			const standardData = data as StandardSurahResponse;
+			if (standardData.chapter && Array.isArray(standardData.chapter)) {
+				return standardData.chapter.map((item) => ({
+					verse: item.verse,
+					text: item.text
+				}));
+			}
+			return [];
+		}
+	}
+
+	/**
+	 * Process the translation text to remove unwanted characters
+	 */
+	private processTranslationText(text: string, edition: Edition): string {
+		let processed = text.replace(/\[\d+\]/g, '');
+
+		if (edition.comments === 'Ponctuation') {
+			processed = processed
+				.replaceAll(' .', '.')
+				.replaceAll(' ,', ',')
+				.replaceAll(' ', ' ') // Remplace les espaces insécables par des espaces normaux
+				.replaceAll(' ;', ';')
+				.replaceAll(' ]', ']')
+				.replaceAll('[ ', '[')
+				.replaceAll(' )', ')')
+				.replaceAll('( ', '(')
+				//hyphem - pour pouvoir sélectionner le mot avant et après le tiret
+				.replaceAll('—', '— ');
+		}
+
+		return processed.trim();
+	}
+
+	/**
+	 * Récupère toutes les traductions des sous-titres du projet pour une édition donnée
+	 * @param edition L'édition de traduction à utiliser
+	 * @returns Un objet contenant les traductions des sous-titres
+	 */
+	async getAllProjectSubtitlesTranslations(edition: Edition) {
+		return this.getAllProjectSubtitlesTranslationsForProject(globalState.currentProject!, edition);
+	}
+
+	/**
+	 * Récupère les textes requis par une édition pour un projet explicitement fourni.
+	 * @param {Project} project Projet dont les pistes doivent être inspectées.
+	 * @param {Edition} edition Édition à télécharger.
+	 * @returns {Promise<Record<string, string>>} Textes indexés par verset ou type prédéfini.
+	 */
+	async getAllProjectSubtitlesTranslationsForProject(
+		project: Project,
+		edition: Edition
+	): Promise<Record<string, string>> {
+		// Récupère toutes les traductions des sous-titres du projet pour une traduction donnée
+		const translations: { [key: string]: string } = {};
+		const translationMetadata = globalState.getTranslationMetadata(edition.language);
+		const clips = project.content.timeline.getFirstTrack(TrackType.Subtitle).clips;
+
+		const versesInProject = new Set<string>();
+
+		for (const predefinedSubtitle of clips.filter(
+			(clip): clip is PredefinedSubtitleClip => clip instanceof PredefinedSubtitleClip
+		)) {
+			// Ajoute les versets des sous-titres pré-définis
+			const type = canonicalizePredefinedSubtitleType(predefinedSubtitle.predefinedSubtitleType);
+			if (!translationMetadata) continue;
+			if (type === 'Other') continue;
+
+			if (type === 'Basmala') {
+				translations['Basmala'] = translationMetadata.basmala;
+			} else if (type === "Isti'adha") {
+				translations["Isti'adha"] = translationMetadata.istiadhah;
+			} else if (type === 'Amin') {
+				translations['Amin'] = translationMetadata.amin;
+			} else if (type === 'Takbir') {
+				translations['Takbir'] = translationMetadata.takbir;
+			} else if (type === 'Tahmeed') {
+				translations['Tahmeed'] = translationMetadata.tahmeed;
+			} else if (type === 'Tasleem') {
+				translations['Tasleem'] = translationMetadata.tasleem;
+			} else if (type === 'Sadaqa') {
+				translations['Sadaqa'] = translationMetadata.sadaqa;
+			}
+		}
+
+		for (const subtitle of clips.filter(
+			(clip): clip is SubtitleClip => clip instanceof SubtitleClip
+		)) {
+			versesInProject.add(subtitle.getVerseKey());
+		}
+
+		// Télécharge les traductions pour chaque verset
+		for (const verseKey of versesInProject) {
+			const [surah, verse] = verseKey.split(':').map(Number);
+			const translationText = await this.downloadVerseTranslation(edition, surah, verse);
+			translations[verseKey] = translationText;
+		}
+
+		return translations;
+	}
+
+	/**
+	 * Ajoute une traduction au projet
+	 * @param {Edition} edition L'édition de traduction à ajouter.
+	 * @param {Record<string, string>} downloadedTranslations Les traductions téléchargées pour cette édition.
+	 * @returns {Promise<boolean>} `false` si le remplacement d'une traduction existante est refusé, sinon `true` après la modification du projet.
+	 */
+	async addTranslation(
+		edition: Edition,
+		downloadedTranslations: Record<string, string>
+	): Promise<boolean> {
+		// Vérifie si l'édition est déjà ajoutée
+		if (this.addedTranslationEditions.some((e) => e.name === edition.name)) {
+			const response = await ModalManager.confirmModal(
+				get(LL).translations.translationAdded({ author: edition.author })
+			);
+			if (!response) return false;
+		}
+		return this.addTranslationToProject(
+			globalState.currentProject!,
+			edition,
+			downloadedTranslations,
+			{ replaceExisting: true }
+		);
+	}
+
+	/**
+	 * Ajoute une édition à un projet explicite sans dépendre du projet ouvert.
+	 * @param {Project} project Projet cible.
+	 * @param {Edition} edition Édition à ajouter.
+	 * @param {Record<string, string>} downloadedTranslations Textes téléchargés par verset.
+	 * @param {{ replaceExisting?: boolean }} options Politique appliquée si l'édition existe déjà.
+	 * @returns {Promise<boolean>} `true` si le projet a été modifié.
+	 */
+	async addTranslationToProject(
+		project: Project,
+		edition: Edition,
+		downloadedTranslations: Record<string, string>,
+		options: { replaceExisting?: boolean } = {}
+	): Promise<boolean> {
+		const alreadyAdded = this.addedTranslationEditions.some((item) => item.name === edition.name);
+		if (alreadyAdded && !options.replaceExisting) return false;
+		if (!alreadyAdded) {
+			edition.showInTranslationsEditor = true;
+			this.addedTranslationEditions.push(edition);
+		}
+		const clips = project.content.timeline.getFirstTrack(TrackType.Subtitle).clips;
+
+		// Pour chaque sous-titre du projet, ajoute la traduction correspondante
+		for (const subtitle of clips.filter(
+			(clip): clip is SubtitleClip => clip instanceof SubtitleClip
+		)) {
+			// Récupère la traduction à partir du dictionnaire de traductions téléchargées
+			const verseKey = subtitle.getVerseKey();
+			const translationText =
+				downloadedTranslations[verseKey] || this.TEXT_NO_TRANSLATION_AVAILABLE;
+
+			if (!this.versesTranslations[edition.name]) {
+				this.versesTranslations[edition.name] = {};
+			}
+
+			this.versesTranslations[edition.name][verseKey] = translationText;
+
+			// Ajoute la traduction à l'objet de traduction du clip
+			subtitle.translations[edition.name] = new VerseTranslation(
+				translationText,
+				subtitle.isFullVerse ? 'completed by default' : 'to review'
+			);
+		}
+
+		// Ajoute maintenant la traduction des sous-titre pré-définis
+		for (const subtitle of clips.filter(
+			(clip): clip is PredefinedSubtitleClip => clip instanceof PredefinedSubtitleClip
+		)) {
+			subtitle.translations[edition.name] = this.getPredefinedSubtitleTranslation(
+				edition,
+				subtitle.predefinedSubtitleType
+			);
+		}
+
+		// Ajoute les styles de traduction par défaut
+		await project.content.videoStyle.addStylesForEdition(edition.name);
+		this.updateProjectPercentage(project, edition);
+		return true;
+	}
+
+	/**
+	 * Recalcule le résumé de complétion d'une édition dans un projet explicite.
+	 * @param {Project} project Projet contenant les traductions.
+	 * @param {Edition} edition Édition à résumer.
+	 * @returns {void}
+	 */
+	updateProjectPercentage(project: Project, edition: Edition): void {
+		let total = 0;
+		let completed = 0;
+		for (const clip of project.content.timeline.getFirstTrack(TrackType.Subtitle).clips) {
+			if (!(clip instanceof SubtitleClip || clip instanceof PredefinedSubtitleClip)) continue;
+			const translation = clip.translations[edition.name];
+			if (!(translation instanceof VerseTranslation)) continue;
+			total++;
+			if (translation.isStatusComplete()) completed++;
+		}
+		project.detail.translations[edition.author] = Math.floor(
+			total > 0 ? (completed / total) * 100 : 0
+		);
+	}
+
+	getPredefinedSubtitleTranslation(edition: Edition, type: string): PredefinedSubtitleTranslation {
+		const lang = globalState.getTranslationMetadata(edition.language);
+		if (!lang) {
+			return new PredefinedSubtitleTranslation('');
+		}
+		const canonicalType = canonicalizePredefinedSubtitleType(type);
+
+		switch (canonicalType) {
+			case 'Basmala':
+				return new PredefinedSubtitleTranslation(lang.basmala);
+			case "Isti'adha":
+				return new PredefinedSubtitleTranslation(lang.istiadhah);
+			case 'Amin':
+				return new PredefinedSubtitleTranslation(lang.amin);
+			case 'Takbir':
+				return new PredefinedSubtitleTranslation(lang.takbir);
+			case 'Tahmeed':
+				return new PredefinedSubtitleTranslation(lang.tahmeed);
+			case 'Tasleem':
+				return new PredefinedSubtitleTranslation(lang.tasleem);
+			case 'Sadaqa':
+				return new PredefinedSubtitleTranslation(lang.sadaqa);
+			default:
+				return new PredefinedSubtitleTranslation('');
+		}
+	}
+
+	async resetTranslation(edition: Edition) {
+		const response = await ModalManager.confirmModal(
+			get(LL).translations.translationResetConfirm({ author: edition.author })
+		);
+
+		if (!response) return;
+
+		// Réinitialise la traduction pour l'édition donnée
+		const translations = await this.getAllProjectSubtitlesTranslations(edition);
+
+		// Supprime l'édition de la liste des traductions ajoutées
+		await this.removeTranslation(edition, true);
+
+		await this.addTranslation(edition, translations);
+
+		globalState.currentProject!.detail.updatePercentageTranslated(edition);
+	}
+
+	async removeTranslation(edition: Edition, force: boolean = false) {
+		if (!force) {
+			const response = await ModalManager.confirmModal(
+				get(LL).translations.translationRemoveConfirm({ author: edition.author })
+			);
+
+			if (!response) return;
+		}
+
+		this.addedTranslationEditions = this.addedTranslationEditions.filter(
+			(e) => e.name !== edition.name
+		);
+
+		// Supprime les traductions de l'édition dans tous les clips traduisibles.
+		for (const subtitle of [
+			...globalState.getSubtitleClips,
+			...globalState.getPredefinedSubtitleClips
+		]) {
+			if (subtitle.translations[edition.name]) {
+				delete subtitle.translations[edition.name];
+			}
+		}
+
+		globalState.currentProject!.detail.updatePercentageTranslated(edition);
+	}
+
+	/**
+	 * Lorsqu'on ajoute un sous-titre au projet après avoir ajouté une traduction,
+	 * on doit récupérer les traductions pour ce verset de toutes les éditions ajoutées.
+	 * @param surah Le numéro de la sourate
+	 * @param verse Le numéro du verset
+	 */
+	async getTranslations(
+		surah: number,
+		verse: number,
+		isFullVerse: boolean
+	): Promise<{
+		[key: string]: VerseTranslation;
+	}> {
+		const translations: { [key: string]: VerseTranslation } = {};
+		if (this.addedTranslationEditions.length > 0) {
+			for (const translationEdition of this.addedTranslationEditions) {
+				const translation = await this.downloadVerseTranslation(translationEdition, surah, verse);
+
+				if (!this.versesTranslations[translationEdition.name]) {
+					this.versesTranslations[translationEdition.name] = {};
+				}
+
+				// Ajoute la traduction à l'objet translations
+				this.versesTranslations[translationEdition.name][surah + ':' + verse] = translation;
+
+				translations[translationEdition.name] = new VerseTranslation(
+					translation,
+					isFullVerse ? 'completed by default' : 'to review'
+				);
+			}
+		}
+		return translations;
+	}
+
+	/**
+	 * Récupère une édition par son nom.
+	 * @param name Le nom de l'édition
+	 * @returns L'édition correspondante ou une erreur
+	 */
+	getEditionFromName(name: string): Edition {
+		const edition = globalState.getProjectTranslation.addedTranslationEditions.find(
+			(e) => e.name === name
+		);
+		if (!edition) {
+			throw new Error(`Edition not found with name: ${name}`);
+		}
+		return edition;
+	}
+}

@@ -1,0 +1,959 @@
+import { applyTextTransform, getTextLineRects } from '$lib/services/TextLayout';
+import { captureExportOverlayBlob } from './ExportScreenshot';
+
+const EXPORT_TEXT_WEIGHT_COMPENSATION_MAX_PX = 0.45;
+const EXPORT_TEXT_WEIGHT_COMPENSATION_RATIO = 0.0125;
+
+type ParsedTextShadow = {
+	color: string;
+	offsetX: number;
+	offsetY: number;
+	blur: number;
+};
+
+type TextDrawRun = {
+	text: string;
+	transform?: DOMMatrix;
+	x: number;
+	y: number;
+	width: number;
+	height: number;
+	font: string;
+	color: string;
+	strokeColor: string;
+	strokeWidth: number;
+	opacity: number;
+	direction: CanvasDirection;
+	align: CanvasTextAlign;
+	letterSpacing: string;
+	wordSpacing: string;
+	filter: string;
+	fontKerning: string;
+	fontStretch: string;
+	fontVariantCaps: string;
+	textDecorationLine: string;
+	textDecorationColor: string;
+	textDecorationStyle: string;
+	textDecorationThickness: string;
+	textUnderlineOffset: string;
+	shadows: ParsedTextShadow[];
+};
+
+type StableTextRunPosition = Pick<TextDrawRun, 'x' | 'y' | 'width' | 'height'>;
+
+type TextFilterScratch = {
+	canvas: HTMLCanvasElement;
+	context: CanvasRenderingContext2D;
+};
+
+type LiveTextCanvasCaptureOptions = {
+	backgroundBlob?: Blob | null;
+	compensateTextWeight?: boolean;
+	textRootSelector?: string;
+};
+
+const stableTimedOverlayTextPositions = new Map<string, StableTextRunPosition>();
+
+/**
+ * Indique si l'optimisation de rendu texte d'export doit etre activee.
+ * @returns `true` si l'agent utilisateur courant est macOS.
+ */
+export function shouldRedrawExportTextWithCanvas(): boolean {
+	return navigator.userAgent.toLowerCase().includes('mac');
+}
+
+/**
+ * Capture l'overlay en PNG en reappliquant le texte en canvas pour macOS.
+ * @param root Element racine de l'overlay export.
+ * @param scale Echelle de capture calculee depuis la cible d'export.
+ * @param targetWidth Largeur de sortie en pixels.
+ * @param targetHeight Hauteur de sortie en pixels.
+ * @param options Options de rendu canvas.
+ * @returns Les octets PNG du frame final.
+ */
+export async function captureMacOsOverlayPngBytes(
+	root: HTMLElement,
+	scale: number,
+	targetWidth: number,
+	targetHeight: number,
+	options: LiveTextCanvasCaptureOptions = {}
+): Promise<Uint8Array<ArrayBuffer>> {
+	const roundedTargetWidth = Math.round(targetWidth);
+	const roundedTargetHeight = Math.round(targetHeight);
+	const compensateTextWeight = options.compensateTextWeight ?? true;
+	const textRuns = collectLiveTextDrawRuns(root, options.textRootSelector);
+
+	if (options.backgroundBlob) {
+		return await blobToExactPngBytesWithLiveText(
+			options.backgroundBlob,
+			textRuns,
+			root.clientWidth,
+			root.clientHeight,
+			roundedTargetWidth,
+			roundedTargetHeight,
+			compensateTextWeight
+		);
+	}
+
+	const restoreCaptureEffects = inlineComputedCaptureEffects(root);
+	const fontImportStylesheets: { sheet: CSSStyleSheet; ruleCount: number }[] = [];
+	for (const sheet of Array.from(document.styleSheets)) {
+		try {
+			for (let index = 0; index < sheet.cssRules.length; index++) {
+				const rule = sheet.cssRules[index];
+				if (
+					rule instanceof CSSImportRule &&
+					rule.href.startsWith('https://fonts.googleapis.com/')
+				) {
+					fontImportStylesheets.push({ sheet, ruleCount: sheet.cssRules.length });
+					break;
+				}
+			}
+		} catch {
+			// Les feuilles externes peuvent refuser l'accès à leurs règles CSS.
+		}
+	}
+	let blob: Blob | null = null;
+
+	try {
+		blob = await captureExportOverlayBlob(root, {
+			width: root.clientWidth,
+			height: root.clientHeight,
+			scale,
+			quality: 1,
+			onCloneNode: (clone) => {
+				if (clone instanceof HTMLElement) hideTextForOverlayCapture(clone);
+			}
+		});
+	} finally {
+		restoreCaptureEffects();
+		// modern-screenshot ajoute les règles importées à la feuille du document à chaque capture.
+		for (const { sheet, ruleCount } of fontImportStylesheets) {
+			while (sheet.cssRules.length > ruleCount) sheet.deleteRule(sheet.cssRules.length - 1);
+		}
+	}
+
+	if (!blob) throw new Error('domToBlob returned null');
+
+	return await blobToExactPngBytesWithLiveText(
+		blob,
+		textRuns,
+		root.clientWidth,
+		root.clientHeight,
+		roundedTargetWidth,
+		roundedTargetHeight,
+		compensateTextWeight
+	);
+}
+
+/**
+ * Encode un canvas en PNG.
+ * @param canvas Canvas source.
+ * @returns Les octets PNG.
+ */
+async function canvasToPngBytes(canvas: HTMLCanvasElement): Promise<Uint8Array<ArrayBuffer>> {
+	const blob = await new Promise<Blob>((resolve, reject) => {
+		canvas.toBlob((value) => {
+			if (value) resolve(value);
+			else reject(new Error('Could not encode export frame as PNG.'));
+		}, 'image/png');
+	});
+
+	return new Uint8Array(await blob.arrayBuffer());
+}
+
+/**
+ * Decode un blob image en element HTMLImageElement.
+ * @param blob Blob PNG source.
+ * @returns L'image decodee.
+ */
+async function decodeBlobAsImage(blob: Blob): Promise<HTMLImageElement> {
+	const url = URL.createObjectURL(blob);
+	const image = new Image();
+
+	try {
+		await new Promise<void>((resolve, reject) => {
+			image.onload = () => resolve();
+			image.onerror = () => reject(new Error('Could not decode export frame PNG.'));
+			image.src = url;
+		});
+		return image;
+	} finally {
+		URL.revokeObjectURL(url);
+	}
+}
+
+/**
+ * Fige les ombres calculees pour garantir une capture visuelle stable.
+ * @param root Element racine de capture.
+ * @returns Une fonction de restauration des styles.
+ */
+function inlineComputedCaptureEffects(root: HTMLElement): () => void {
+	const changedElements: Array<{
+		element: HTMLElement;
+		textShadow: string;
+		boxShadow: string;
+	}> = [];
+
+	for (const element of Array.from(root.querySelectorAll<HTMLElement>('*'))) {
+		const computedStyle = getComputedStyle(element);
+		const textShadow = computedStyle.textShadow;
+		const boxShadow = computedStyle.boxShadow;
+		const hasTextShadow = textShadow && textShadow !== 'none';
+		const hasBoxShadow = boxShadow && boxShadow !== 'none';
+
+		if (!hasTextShadow && !hasBoxShadow) continue;
+
+		changedElements.push({
+			element,
+			textShadow: element.style.textShadow,
+			boxShadow: element.style.boxShadow
+		});
+
+		if (hasTextShadow) element.style.textShadow = textShadow;
+		if (hasBoxShadow) element.style.boxShadow = boxShadow;
+	}
+
+	return () => {
+		for (const { element, textShadow, boxShadow } of changedElements) {
+			element.style.textShadow = textShadow;
+			element.style.boxShadow = boxShadow;
+		}
+	};
+}
+
+/**
+ * Separe proprement une liste CSS d'ombres en tenant compte des parenthèses.
+ * @param value Valeur CSS brute.
+ * @returns Liste des ombres individuelles.
+ */
+function splitCssShadowList(value: string): string[] {
+	const shadows: string[] = [];
+	let depth = 0;
+	let current = '';
+
+	for (const char of value) {
+		if (char === '(') depth += 1;
+		if (char === ')') depth = Math.max(0, depth - 1);
+		if (char === ',' && depth === 0) {
+			shadows.push(current.trim());
+			current = '';
+			continue;
+		}
+		current += char;
+	}
+
+	if (current.trim()) shadows.push(current.trim());
+	return shadows;
+}
+
+/**
+ * Remplace les variables CSS par leurs valeurs calculees.
+ * @param value Valeur CSS source.
+ * @param computedStyle Style calcule contenant les variables.
+ * @returns Valeur CSS avec variables resolues quand possible.
+ */
+function resolveCssVariables(value: string, computedStyle?: CSSStyleDeclaration): string {
+	if (!computedStyle) return value;
+
+	return value.replace(/var\((--[\w-]+)(?:,\s*([^)]+))?\)/g, (_match, name, fallback = '') => {
+		return computedStyle.getPropertyValue(name).trim() || String(fallback).trim();
+	});
+}
+
+/**
+ * Calcule les `calc()` simples utilises par les ombres texte.
+ * @param value Valeur CSS source.
+ * @returns Valeur CSS avec `calc(nombrepx * facteur)` converti en pixels.
+ */
+function resolveSimpleLengthCalcs(value: string): string {
+	const numberPattern = '-?(?:\\d+\\.?\\d*|\\.\\d+)';
+	const leftPx = new RegExp(
+		`calc\\(\\s*(${numberPattern})px\\s*([*/])\\s*(${numberPattern})\\s*\\)`,
+		'g'
+	);
+	const rightPx = new RegExp(
+		`calc\\(\\s*(${numberPattern})\\s*([*/])\\s*(${numberPattern})px\\s*\\)`,
+		'g'
+	);
+	const replaceCalc = (_match: string, left: string, operator: string, right: string) => {
+		const leftValue = Number.parseFloat(left);
+		const rightValue = Number.parseFloat(right);
+		if (!Number.isFinite(leftValue) || !Number.isFinite(rightValue)) return _match;
+		if (operator === '/' && rightValue === 0) return _match;
+		return `${operator === '*' ? leftValue * rightValue : leftValue / rightValue}px`;
+	};
+
+	return value.replace(leftPx, replaceCalc).replace(rightPx, replaceCalc);
+}
+
+/**
+ * Extrait les longueurs CSS en pixels d'une ombre texte.
+ * @param value Partie numerique d'une ombre CSS.
+ * @returns Longueurs en pixels dans leur ordre CSS.
+ */
+function parseShadowLengths(value: string): number[] {
+	const normalized = resolveSimpleLengthCalcs(value);
+	const lengths: number[] = [];
+	const lengthPattern = /(^|[\s(,])(-?(?:\d+\.?\d*|\.\d+)(?:px)?)(?=$|[\s),])/g;
+	let match: RegExpExecArray | null;
+
+	while ((match = lengthPattern.exec(normalized)) !== null) {
+		const token = match[2];
+		const parsed = Number.parseFloat(token);
+		if (!Number.isFinite(parsed)) continue;
+		if (token.endsWith('px') || parsed === 0) lengths.push(parsed);
+	}
+
+	return lengths;
+}
+
+/**
+ * Parse une ombre texte CSS simple vers un format exploitable en canvas.
+ * @param shadow Ombre CSS.
+ * @param fallbackColor Couleur par defaut.
+ * @param computedStyle Style calcule associe au texte.
+ * @returns L'ombre parsee ou `null` si invalide.
+ */
+function parseTextShadow(
+	shadow: string,
+	fallbackColor: string,
+	computedStyle?: CSSStyleDeclaration
+): ParsedTextShadow | null {
+	const resolvedShadow = resolveCssVariables(shadow, computedStyle);
+	const colorMatch = resolvedShadow.match(
+		/(?:rgba?|hsla?|hwb|lab|lch|oklab|oklch|color)\([^)]*\)|#[0-9a-fA-F]{3,8}\b|\b(?!calc\b|var\b|px\b)[a-zA-Z]+\b/
+	);
+	const color = colorMatch?.[0] ?? fallbackColor;
+	const numericPart = colorMatch ? resolvedShadow.replace(colorMatch[0], ' ') : resolvedShadow;
+	const numbers = parseShadowLengths(numericPart);
+
+	if (numbers.length < 2) return null;
+
+	return {
+		color,
+		offsetX: numbers[0],
+		offsetY: numbers[1],
+		blur: numbers[2] ?? 0
+	};
+}
+
+/**
+ * Parse toutes les ombres texte d'un style CSS.
+ * @param textShadow Valeur de `text-shadow`.
+ * @param fallbackColor Couleur de repli.
+ * @param computedStyle Style calcule associe au texte.
+ * @returns La liste des ombres parsees.
+ */
+function parseTextShadows(
+	textShadow: string,
+	fallbackColor: string,
+	computedStyle?: CSSStyleDeclaration
+): ParsedTextShadow[] {
+	if (!textShadow || textShadow === 'none') return [];
+	return splitCssShadowList(textShadow)
+		.map((shadow) => parseTextShadow(shadow, fallbackColor, computedStyle))
+		.filter((shadow): shadow is ParsedTextShadow => shadow !== null);
+}
+
+/**
+ * Traduit une direction CSS vers `CanvasDirection`.
+ * @param value Direction CSS.
+ * @returns Direction canvas.
+ */
+function toCanvasDirection(value: string): CanvasDirection {
+	return value === 'rtl' ? 'rtl' : 'ltr';
+}
+
+/**
+ * Traduit une direction canvas vers alignement texte.
+ * @param direction Direction canvas.
+ * @returns Alignement canvas.
+ */
+function toCanvasTextAlign(direction: CanvasDirection): CanvasTextAlign {
+	return direction === 'rtl' ? 'right' : 'left';
+}
+
+/**
+ * Calcule l'opacite cumulée du noeud jusqu'a la racine de capture.
+ * @param element Element courant.
+ * @param root Racine de capture.
+ * @returns Opacite cumulee.
+ */
+function getCumulativeOpacity(element: HTMLElement, root: HTMLElement): number {
+	let opacity = 1;
+	let current: HTMLElement | null = element;
+
+	while (current && current !== root.parentElement) {
+		const currentOpacity = Number(getComputedStyle(current).opacity);
+		if (Number.isFinite(currentOpacity)) opacity *= currentOpacity;
+		if (current === root) break;
+		current = current.parentElement;
+	}
+
+	return opacity;
+}
+
+/**
+ * Recupere les filtres CSS actifs sur le texte et ses parents.
+ * @param element Element courant.
+ * @param root Racine de capture.
+ * @returns Filtres CSS cumules dans leur ordre d'application.
+ */
+function getCumulativeFilter(element: HTMLElement, root: HTMLElement): string {
+	const filters: string[] = [];
+	let current: HTMLElement | null = element;
+
+	while (current && current !== root.parentElement) {
+		const filter = getComputedStyle(current).filter;
+		if (filter && filter !== 'none') filters.push(filter);
+		if (current === root) break;
+		current = current.parentElement;
+	}
+
+	return filters.join(' ');
+}
+
+/**
+ * Construit une cle de position stable pour le texte d'un overlay temporise.
+ * @param parent Element parent du noeud texte.
+ * @param text Texte visible.
+ * @param computedStyle Style calcule du texte.
+ * @param {Map<HTMLElement, { value: string }>} transforms Transformations avant la mesure DOM.
+ * @returns Cle stable ou null pour les textes non concernes.
+ */
+function getStableTimedOverlayTextPositionKey(
+	parent: HTMLElement,
+	text: string,
+	computedStyle: CSSStyleDeclaration,
+	transforms: Map<HTMLElement, { value: string }>
+): string | null {
+	const overlay = parent.closest<HTMLElement>('[data-overlay-max-opacity]');
+	if (!overlay) return null;
+
+	return [
+		transforms.get(overlay)?.value ?? overlay.style.transform,
+		text,
+		computedStyle.font,
+		computedStyle.direction,
+		computedStyle.textAlign
+	].join('|');
+}
+
+/**
+ * Stabilise la position d'un texte d'overlay temporise entre deux captures.
+ * @param key Cle stable de l'overlay.
+ * @param position Position mesuree pour la capture courante.
+ * @returns Position stabilisee.
+ */
+function stabilizeTimedOverlayTextPosition(
+	key: string | null,
+	position: StableTextRunPosition
+): StableTextRunPosition {
+	if (!key) return position;
+
+	const stablePosition = stableTimedOverlayTextPositions.get(key);
+	if (stablePosition) return stablePosition;
+
+	stableTimedOverlayTextPositions.set(key, position);
+	return position;
+}
+
+/**
+ * Extrait les runs texte visibles a redessiner en canvas.
+ * @param root Racine de capture.
+ * @param textRootSelector Selecteur optionnel limitant le texte a redessiner.
+ * @returns Liste des runs texte.
+ */
+function collectLiveTextDrawRuns(root: HTMLElement, textRootSelector?: string): TextDrawRun[] {
+	const transforms = new Map<
+		HTMLElement,
+		{
+			value: string;
+			priority: string;
+			rotateValue: string;
+			rotatePriority: string;
+			matrix: DOMMatrix;
+			transform?: DOMMatrix;
+		}
+	>();
+	try {
+		for (const element of root.querySelectorAll<HTMLElement>('*')) {
+			const style = getComputedStyle(element);
+			const angle = /^-?[\d.]+deg$/.test(style.rotate) ? Number.parseFloat(style.rotate) : 0;
+			if (style.transform === 'none' && angle === 0) continue;
+			transforms.set(element, {
+				value: element.style.getPropertyValue('transform'),
+				priority: element.style.getPropertyPriority('transform'),
+				rotateValue: element.style.getPropertyValue('rotate'),
+				rotatePriority: element.style.getPropertyPriority('rotate'),
+				matrix: new DOMMatrix()
+					.rotate(angle)
+					.multiply(new DOMMatrix(style.transform === 'none' ? undefined : style.transform))
+			});
+			// L'identité conserve le bloc de positionnement des descendants pendant la mesure.
+			element.style.setProperty('transform', 'matrix(1, 0, 0, 1, 0, 0)', 'important');
+			element.style.setProperty('rotate', 'none', 'important');
+		}
+		const rootRect = root.getBoundingClientRect();
+		const localScaleX = root.clientWidth / rootRect.width;
+		const localScaleY = root.clientHeight / rootRect.height;
+		for (const [element, entry] of transforms) {
+			const rect = element.getBoundingClientRect();
+			const [originX, originY] = getComputedStyle(element)
+				.transformOrigin.split(' ')
+				.map(Number.parseFloat);
+			const x = (rect.left - rootRect.left) * localScaleX + originX;
+			const y = (rect.top - rootRect.top) * localScaleY + originY;
+			entry.transform = new DOMMatrix().translate(x, y).multiply(entry.matrix).translate(-x, -y);
+		}
+		const runs: TextDrawRun[] = [];
+		const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+
+		while (walker.nextNode()) {
+			const textNode = walker.currentNode as Text;
+			const parent = textNode.parentElement;
+			if (!parent || !textNode.data.trim()) continue;
+			// Les deux calques DOM représentent un seul texte à retracer dans le canvas.
+			if (parent.closest('.native-text-foreground')) continue;
+			if (textRootSelector && !parent.closest(textRootSelector)) continue;
+
+			const computedStyle = getComputedStyle(parent);
+			const shadowLayer = parent.closest('.native-text-shadows');
+			const strokeStyle = shadowLayer?.parentElement
+				? getComputedStyle(shadowLayer.parentElement)
+				: computedStyle;
+			if (computedStyle.display === 'none' || computedStyle.visibility === 'hidden') continue;
+
+			const opacity = getCumulativeOpacity(parent, root);
+			if (opacity <= 0) continue;
+			let transform: DOMMatrix | undefined;
+			for (
+				let element: HTMLElement | null = parent;
+				element && element !== root;
+				element = element.parentElement
+			) {
+				const ancestorTransform = transforms.get(element)?.transform;
+				if (ancestorTransform) transform = ancestorTransform.multiply(transform ?? new DOMMatrix());
+			}
+
+			const direction = toCanvasDirection(computedStyle.direction);
+			const align = toCanvasTextAlign(direction);
+			const shadows = parseTextShadows(
+				computedStyle.textShadow,
+				computedStyle.color,
+				computedStyle
+			);
+
+			for (const line of getTextLineRects(textNode, localScaleY)) {
+				const text = textNode.data.slice(line.start, line.end).trim();
+				if (!text) continue;
+
+				const x =
+					direction === 'rtl'
+						? (line.rect.right - rootRect.left) * localScaleX
+						: (line.rect.left - rootRect.left) * localScaleX;
+				const stablePosition = stabilizeTimedOverlayTextPosition(
+					getStableTimedOverlayTextPositionKey(parent, text, computedStyle, transforms),
+					{
+						x,
+						y: (line.rect.top - rootRect.top) * localScaleY,
+						width: line.rect.width * localScaleX,
+						height: line.rect.height * localScaleY
+					}
+				);
+
+				runs.push({
+					text: applyTextTransform(text, computedStyle.textTransform),
+					transform,
+					x: stablePosition.x,
+					y: stablePosition.y,
+					width: stablePosition.width,
+					height: stablePosition.height,
+					font: computedStyle.font,
+					color: computedStyle.color,
+					strokeColor: strokeStyle.webkitTextStrokeColor,
+					strokeWidth: Number.parseFloat(strokeStyle.webkitTextStrokeWidth) || 0,
+					opacity,
+					direction,
+					align,
+					letterSpacing: computedStyle.letterSpacing,
+					wordSpacing: computedStyle.wordSpacing,
+					filter: getCumulativeFilter(parent, root),
+					fontKerning: computedStyle.fontKerning,
+					fontStretch: computedStyle.fontStretch,
+					fontVariantCaps: computedStyle.fontVariantCaps,
+					textDecorationLine: computedStyle.textDecorationLine,
+					textDecorationColor: computedStyle.textDecorationColor,
+					textDecorationStyle: computedStyle.textDecorationStyle,
+					textDecorationThickness: computedStyle.textDecorationThickness,
+					textUnderlineOffset: computedStyle.textUnderlineOffset,
+					shadows
+				});
+			}
+		}
+
+		return runs;
+	} finally {
+		for (const [element, entry] of transforms) {
+			if (entry.value) element.style.setProperty('transform', entry.value, entry.priority);
+			else element.style.removeProperty('transform');
+			if (entry.rotateValue)
+				element.style.setProperty('rotate', entry.rotateValue, entry.rotatePriority);
+			else element.style.removeProperty('rotate');
+		}
+	}
+}
+
+/**
+ * Masque le texte du clone de capture pour eviter un double rendu.
+ * @param root Racine de capture.
+ */
+function hideTextForOverlayCapture(root: HTMLElement): void {
+	for (const outline of root.querySelectorAll<SVGElement>('.rounded-text-outline')) {
+		outline.style.visibility = 'hidden';
+	}
+	for (const element of Array.from(root.querySelectorAll<HTMLElement>('*'))) {
+		if (!element.textContent?.trim()) continue;
+
+		element.style.color = 'transparent';
+		element.style.webkitTextFillColor = 'transparent';
+		element.style.webkitTextStrokeColor = 'transparent';
+		element.style.textShadow = 'none';
+		element.style.textDecorationColor = 'transparent';
+	}
+}
+
+/**
+ * Applique une mise a l'echelle au premier `font-size` d'une declaration `font` CSS.
+ * @param font Shorthand CSS `font`.
+ * @param scale Facteur d'echelle.
+ * @returns Font redimensionnee.
+ */
+function scaleCanvasFont(font: string, scale: number): string {
+	let replaced = false;
+	return font.replace(/(\d*\.?\d+)px/, (match, size: string) => {
+		if (replaced) return match;
+		replaced = true;
+		return `${Number.parseFloat(size) * scale}px`;
+	});
+}
+
+/**
+ * Extrait la taille de police en pixels depuis un shorthand CSS `font`.
+ * @param font Shorthand CSS `font`.
+ * @returns Taille en pixels ou `null` si absente.
+ */
+function getFontSizePx(font: string): number | null {
+	const match = font.match(/(\d*\.?\d+)px/);
+	if (!match) return null;
+	const size = Number.parseFloat(match[1]);
+	return Number.isFinite(size) ? size : null;
+}
+
+/**
+ * Met a l'echelle chaque valeur en `px` d'une chaine CSS.
+ * @param value Valeur CSS source.
+ * @param scale Facteur d'echelle.
+ * @returns Valeur CSS redimensionnee.
+ */
+function scaleCssPixelValue(value: string, scale: number): string {
+	if (!value || value === 'normal') return value;
+	return value.replace(/(-?\d*\.?\d+)px/g, (_match, size: string) => {
+		return `${Number.parseFloat(size) * scale}px`;
+	});
+}
+
+/**
+ * Convertit une longueur CSS simple en pixels.
+ * @param value Valeur CSS source.
+ * @param fontSizePx Taille de police de reference.
+ * @param fallbackPx Valeur de repli en pixels.
+ * @returns Longueur convertie en pixels.
+ */
+function cssLengthToPx(value: string, fontSizePx: number | null, fallbackPx: number): number {
+	if (!value || value === 'auto' || value === 'from-font' || value === 'normal') return fallbackPx;
+
+	const parsed = Number.parseFloat(value);
+	if (!Number.isFinite(parsed)) return fallbackPx;
+	if (value.endsWith('em')) return parsed * (fontSizePx ?? fallbackPx);
+	return parsed;
+}
+
+/**
+ * Dessine le soulignement d'un run texte.
+ * @param context Contexte canvas 2D.
+ * @param run Donnees de texte a dessiner.
+ * @param scaleX Echelle horizontale finale.
+ * @param scaleY Echelle verticale finale.
+ * @param fontSizePx Taille de police en pixels CSS.
+ */
+function drawTextUnderline(
+	context: CanvasRenderingContext2D,
+	run: TextDrawRun,
+	scaleX: number,
+	scaleY: number,
+	fontSizePx: number | null
+) {
+	if (!run.textDecorationLine.includes('underline')) return;
+
+	const sourceFontSize = fontSizePx ?? run.height;
+	const thickness = cssLengthToPx(
+		run.textDecorationThickness,
+		fontSizePx,
+		Math.max(1, sourceFontSize * 0.05)
+	);
+	const offset = cssLengthToPx(run.textUnderlineOffset, fontSizePx, sourceFontSize * 0.08);
+	const startX = run.direction === 'rtl' ? (run.x - run.width) * scaleX : run.x * scaleX;
+	const endX = run.direction === 'rtl' ? run.x * scaleX : (run.x + run.width) * scaleX;
+	const y = (run.y + sourceFontSize + offset) * scaleY;
+	const lineWidth = thickness * Math.max(scaleX, scaleY);
+
+	context.save();
+	context.shadowColor = 'transparent';
+	context.shadowBlur = 0;
+	context.shadowOffsetX = 0;
+	context.shadowOffsetY = 0;
+	context.strokeStyle = run.textDecorationColor || run.color;
+	context.lineWidth = lineWidth;
+	context.lineCap = run.textDecorationStyle === 'dotted' ? 'round' : 'butt';
+
+	if (run.textDecorationStyle === 'dashed') {
+		context.setLineDash([lineWidth * 3, lineWidth * 2]);
+	} else if (run.textDecorationStyle === 'dotted') {
+		context.setLineDash([lineWidth, lineWidth * 2]);
+	}
+
+	context.beginPath();
+	context.moveTo(startX, y);
+	context.lineTo(endX, y);
+	context.stroke();
+	context.restore();
+}
+
+/**
+ * Dessine le contenu texte brut d'un run.
+ * @param context Contexte canvas 2D.
+ * @param run Donnees de texte a dessiner.
+ * @param scaleX Echelle horizontale finale.
+ * @param scaleY Echelle verticale finale.
+ * @param compensateTextWeight Compense legerement l'epaisseur du texte.
+ * @param opacity Opacite appliquee au rendu brut.
+ */
+function drawTextRunContent(
+	context: CanvasRenderingContext2D,
+	run: TextDrawRun,
+	scaleX: number,
+	scaleY: number,
+	compensateTextWeight: boolean,
+	opacity: number
+) {
+	const x = run.x * scaleX;
+	let y = run.y * scaleY;
+	const fontSizePx = getFontSizePx(run.font);
+	const compensationCssPx = !compensateTextWeight
+		? 0
+		: fontSizePx === null
+			? EXPORT_TEXT_WEIGHT_COMPENSATION_MAX_PX
+			: Math.min(
+					EXPORT_TEXT_WEIGHT_COMPENSATION_MAX_PX,
+					fontSizePx * EXPORT_TEXT_WEIGHT_COMPENSATION_RATIO
+				);
+	const compensationWidth = compensationCssPx * Math.max(scaleX, scaleY);
+
+	context.save();
+	context.globalAlpha = opacity;
+	if (run.transform) {
+		const { a, b, c, d, e, f } = run.transform;
+		context.transform(a, (b * scaleY) / scaleX, (c * scaleX) / scaleY, d, e * scaleX, f * scaleY);
+	}
+	context.font = scaleCanvasFont(run.font, scaleY);
+	context.fillStyle = run.color;
+	context.strokeStyle = run.color;
+	context.lineJoin = 'round';
+	context.miterLimit = 2;
+	context.textBaseline = 'top';
+	context.textAlign = run.align;
+	context.direction = run.direction;
+	// Le haut du cadre DOM peut dépasser le repère « top » du canvas selon la police.
+	const fontAscent = context.measureText(run.text).fontBoundingBoxAscent;
+	if (Number.isFinite(fontAscent)) y += fontAscent;
+	const extendedContext = context as CanvasRenderingContext2D & {
+		letterSpacing?: string;
+		wordSpacing?: string;
+		textRendering?: string;
+	} & Record<string, string | undefined>;
+	if ('letterSpacing' in extendedContext) {
+		extendedContext.letterSpacing = scaleCssPixelValue(run.letterSpacing, scaleX);
+	}
+	if ('wordSpacing' in extendedContext) {
+		extendedContext.wordSpacing = scaleCssPixelValue(run.wordSpacing, scaleX);
+	}
+	if ('fontKerning' in extendedContext) {
+		(extendedContext as Record<string, string | undefined>).fontKerning = run.fontKerning;
+	}
+	if ('fontStretch' in extendedContext) {
+		(extendedContext as Record<string, string | undefined>).fontStretch = run.fontStretch;
+	}
+	if ('fontVariantCaps' in extendedContext) {
+		(extendedContext as Record<string, string | undefined>).fontVariantCaps = run.fontVariantCaps;
+	}
+	if ('textRendering' in extendedContext) {
+		extendedContext.textRendering = 'geometricPrecision';
+	}
+
+	const clearShadow = () => {
+		context.shadowColor = 'transparent';
+		context.shadowBlur = 0;
+		context.shadowOffsetX = 0;
+		context.shadowOffsetY = 0;
+	};
+
+	const fillCompensatedText = () => {
+		clearShadow();
+		if (run.strokeWidth > 0) {
+			context.save();
+			context.strokeStyle = run.strokeColor;
+			context.lineWidth = run.strokeWidth * Math.max(scaleX, scaleY);
+			// Comme en SVG, des segments jointifs arrondis évitent les creux sur les petits glyphes.
+			context.lineCap = 'round';
+			context.setLineDash([Math.max(scaleX, scaleY), 0]);
+			context.strokeText(run.text, x, y);
+			context.restore();
+		}
+
+		if (compensationWidth > 0) {
+			// Le trait leger compense la perte de poids visible sur certains rendus macOS.
+			context.save();
+			context.lineWidth = compensationWidth;
+			context.strokeText(run.text, x, y);
+			context.restore();
+		}
+
+		context.fillText(run.text, x, y);
+	};
+
+	fillCompensatedText();
+	drawTextUnderline(context, run, scaleX, scaleY, fontSizePx);
+
+	if (run.shadows.length > 0) {
+		context.globalCompositeOperation = 'destination-over';
+		for (const shadow of run.shadows) {
+			context.save();
+			context.shadowColor = shadow.color;
+			context.shadowBlur = shadow.blur * Math.max(scaleX, scaleY);
+			context.shadowOffsetX =
+				(run.transform
+					? run.transform.a * shadow.offsetX + run.transform.c * shadow.offsetY
+					: shadow.offsetX) * scaleX;
+			context.shadowOffsetY =
+				(run.transform
+					? run.transform.b * shadow.offsetX + run.transform.d * shadow.offsetY
+					: shadow.offsetY) * scaleY;
+			context.fillText(run.text, x, y);
+			context.restore();
+		}
+	}
+
+	context.restore();
+}
+
+/**
+ * Dessine un run texte en reconstituant le poids, les ombres et les filtres.
+ * @param context Contexte canvas 2D.
+ * @param run Donnees de texte a dessiner.
+ * @param scaleX Echelle horizontale finale.
+ * @param scaleY Echelle verticale finale.
+ * @param compensateTextWeight Compense legerement l'epaisseur du texte.
+ * @param filterScratch Canvas temporaire pour appliquer le filtre au rendu complet.
+ */
+function drawTextRun(
+	context: CanvasRenderingContext2D,
+	run: TextDrawRun,
+	scaleX: number,
+	scaleY: number,
+	compensateTextWeight: boolean,
+	filterScratch: TextFilterScratch | null
+) {
+	const filter =
+		run.filter && run.filter !== 'none'
+			? scaleCssPixelValue(run.filter, Math.max(scaleX, scaleY))
+			: '';
+
+	if (!filter || !filterScratch) {
+		drawTextRunContent(context, run, scaleX, scaleY, compensateTextWeight, run.opacity);
+		return;
+	}
+
+	filterScratch.context.clearRect(0, 0, filterScratch.canvas.width, filterScratch.canvas.height);
+	drawTextRunContent(filterScratch.context, run, scaleX, scaleY, compensateTextWeight, 1);
+
+	context.save();
+	context.globalAlpha = run.opacity;
+	const extendedContext = context as CanvasRenderingContext2D & { filter?: string };
+	if ('filter' in extendedContext) extendedContext.filter = filter;
+	context.drawImage(filterScratch.canvas, 0, 0);
+	context.restore();
+}
+
+/**
+ * Fusionne l'image capturee avec les runs texte reconstitues au format cible.
+ * @param blob Capture PNG de l'overlay sans texte.
+ * @param textRuns Runs texte a dessiner.
+ * @param sourceWidth Largeur source de capture.
+ * @param sourceHeight Hauteur source de capture.
+ * @param targetWidth Largeur cible.
+ * @param targetHeight Hauteur cible.
+ * @param compensateTextWeight Compense legerement l'epaisseur du texte.
+ * @returns Les octets PNG du frame reconstruit.
+ */
+async function blobToExactPngBytesWithLiveText(
+	blob: Blob,
+	textRuns: TextDrawRun[],
+	sourceWidth: number,
+	sourceHeight: number,
+	targetWidth: number,
+	targetHeight: number,
+	compensateTextWeight: boolean
+): Promise<Uint8Array<ArrayBuffer>> {
+	const image = await decodeBlobAsImage(blob);
+	const canvas = document.createElement('canvas');
+	canvas.width = targetWidth;
+	canvas.height = targetHeight;
+
+	// WKWebView peut substituer les polices locales si le contexte est créé hors du document.
+	const canvasHost = document.createElement('div');
+	canvasHost.hidden = true;
+	canvasHost.append(canvas);
+	document.body.append(canvasHost);
+	try {
+		const context = canvas.getContext('2d');
+		if (!context) throw new Error('Could not create export frame canvas.');
+
+		context.imageSmoothingEnabled = true;
+		context.imageSmoothingQuality = 'high';
+		context.clearRect(0, 0, targetWidth, targetHeight);
+		context.drawImage(image, 0, 0, targetWidth, targetHeight);
+
+		const scaleX = targetWidth / sourceWidth;
+		const scaleY = targetHeight / sourceHeight;
+		let filterScratch: TextFilterScratch | null = null;
+		if (textRuns.some((run) => run.filter && run.filter !== 'none')) {
+			const scratchCanvas = document.createElement('canvas');
+			scratchCanvas.width = targetWidth;
+			scratchCanvas.height = targetHeight;
+			canvasHost.append(scratchCanvas);
+			const scratchContext = scratchCanvas.getContext('2d');
+			if (!scratchContext) throw new Error('Could not create export text filter canvas.');
+			filterScratch = { canvas: scratchCanvas, context: scratchContext };
+		}
+
+		for (const run of textRuns) {
+			drawTextRun(context, run, scaleX, scaleY, compensateTextWeight, filterScratch);
+		}
+
+		return await canvasToPngBytes(canvas);
+	} finally {
+		canvasHost.remove();
+	}
+}

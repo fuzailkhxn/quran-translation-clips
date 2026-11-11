@@ -1,0 +1,58 @@
+node_modules
+
+# Output
+.output
+.vercel
+.netlify
+.wrangler
+/.svelte-kit
+# Nested .svelte-kit dirs generated when svelte-check runs from a subfolder.
+.svelte-kit/
+/build
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env
+.env
+.env.*
+!.env.example
+!.env.test
+
+# Vite
+vite.config.js.timestamp-*
+vite.config.ts.timestamp-*
+src-tauri/2
+
+# Special
+src-tauri/binaries/*.exe
+*.bak
+src-tauri/binaries/ffmpeg
+src-tauri/binaries/ffprobe
+src-tauri/binaries/yt-dlp
+ffmpeg_failed_*.txt
+
+tmp/
+venv/
+.venv/
+src-tauri/python/venv/
+src-tauri/python/segment_core/__pycache__/
+src-tauri/python/segment_core/data/
+src-tauri/python/quran-multi-aligner/data/
+src-tauri/usage_logs/
+src-tauri/python/__pycache__/
+src-tauri/python/**/__pycache__/
+src-tauri/python/quran_recite_to_text/data/onnx/*.onnx
+*.pyc
+
+# Tauri signing keys (NEVER commit private keys)
+.tauri/
+__screenshots__
+
+# Codex
+.codex/AGENTS.md
+.opencode
+
+src-tauri/gen/android/*
+/src-tauri/plugins/android-media/

@@ -1,0 +1,374 @@
+<script lang="ts">
+	import { globalState } from '$lib/runes/main.svelte';
+	import { mount, onDestroy, onMount } from 'svelte';
+	import AssetViewer from './AssetViewer.svelte';
+	import { getCurrentWebview } from '@tauri-apps/api/webview';
+	import DropOverlay from './DropOverlay.svelte';
+	import Section from '$lib/components/projectEditor/Section.svelte';
+	import { open } from '@tauri-apps/plugin-dialog';
+	import LL from '$lib/i18n/i18n-svelte';
+	import { get } from 'svelte/store';
+	import { AssetType, SourceType, type Asset } from '$lib/classes';
+	import { ProjectHistoryManager } from '$lib/services/undoRedo/ProjectHistoryManager';
+	import toast from 'svelte-5-french-toast';
+	import ContextMenu, { Item } from 'svelte-contextmenu';
+	import { currentMenu } from 'svelte-contextmenu/stores';
+	import ModalManager from '$lib/components/modals/ModalManager';
+	import { invoke } from '@tauri-apps/api/core';
+
+	let unlisten: () => void;
+	let dropZone: HTMLDivElement;
+	let selectedTimelineContextMenu: ContextMenu | undefined = $state(undefined);
+	let selectedTimelineContextMenuElement: HTMLElement | null = null;
+	let wasSelectedTimelineContextMenuOpenOnPointerDown = false;
+	let selectedAssetIds: number[] = $state([]);
+	let selectedAssets = $derived(
+		globalState.currentProject!.content.assets.filter((asset) =>
+			selectedAssetIds.includes(asset.id)
+		)
+	);
+	let areAllAssetsSelected = $derived(
+		globalState.currentProject!.content.assets.length > 0 &&
+			selectedAssetIds.length === globalState.currentProject!.content.assets.length
+	);
+	let hasVideoCompatibleSelection = $derived(
+		selectedAssets.some((asset) => asset.type !== AssetType.Audio)
+	);
+	let hasAudioCompatibleSelection = $derived(
+		selectedAssets.some((asset) => asset.type !== AssetType.Image)
+	);
+	let emptyCopy = $derived(
+		$LL.editor as unknown as {
+			mediaEmptyTitle: () => string;
+			mediaEmptyDescription: () => string;
+			addRecitation: () => string;
+			removeSelectedAssetsConfirm: (args: { count: number }) => string;
+		}
+	);
+
+	onMount(async () => {
+		unlisten = await getCurrentWebview().onDragDropEvent((event) => {
+			if (event.payload.type === 'over') {
+				if (!globalState.currentProject!.projectEditorState.showDropScreen)
+					globalState.currentProject!.projectEditorState.showDropScreen = true;
+			} else if (event.payload.type === 'drop') {
+				if (globalState.currentProject!.projectEditorState.showDropScreen) {
+					globalState.currentProject!.projectEditorState.showDropScreen = false;
+					// Ajoute le(s) fichier(s) au projet
+					for (const file of event.payload.paths) {
+						globalState.currentProject?.content.addAsset(file);
+					}
+				}
+			} else {
+				if (globalState.currentProject!.projectEditorState.showDropScreen)
+					globalState.currentProject!.projectEditorState.showDropScreen = false;
+			}
+		});
+	});
+
+	$effect(() => {
+		if (globalState.currentProject!.projectEditorState.showDropScreen) {
+			const container = document.createElement('div');
+			container.id = 'drop-overlay-container';
+			document.body.appendChild(container);
+
+			// Monter le composant Svelte 5
+			mount(DropOverlay, {
+				target: container
+			});
+
+			return () => {
+				container.remove();
+			};
+		}
+	});
+
+	$effect(() => {
+		const assetIds = new Set(globalState.currentProject!.content.assets.map((asset) => asset.id));
+		const validSelection = selectedAssetIds.filter((id) => assetIds.has(id));
+		if (validSelection.length !== selectedAssetIds.length) selectedAssetIds = validSelection;
+	});
+
+	onDestroy(() => {
+		if (unlisten) unlisten();
+		currentMenu.set(null);
+	});
+
+	async function addAssetButtonClick() {
+		// Open a dialog
+		const files = await open({
+			multiple: true,
+			directory: false
+		});
+
+		if (!files) return;
+
+		for (let i = 0; i < files.length; i++) {
+			const element = files[i];
+			globalState.currentProject?.content.addAsset(element);
+		}
+	}
+
+	/**
+	 * Ajoute ou retire un asset de la sélection multiple.
+	 * @param {number} assetId Identifiant de l'asset à basculer.
+	 * @returns {void}
+	 */
+	function toggleAssetSelection(assetId: number): void {
+		selectedAssetIds = selectedAssetIds.includes(assetId)
+			? selectedAssetIds.filter((id) => id !== assetId)
+			: [...selectedAssetIds, assetId];
+	}
+
+	/**
+	 * Sélectionne tous les assets ou vide la sélection courante.
+	 * @returns {void}
+	 */
+	function toggleAllAssets(): void {
+		selectedAssetIds = areAllAssetsSelected
+			? []
+			: globalState.currentProject!.content.assets.map((asset) => asset.id);
+	}
+
+	/**
+	 * Confirme puis retire du projet tous les assets sélectionnés.
+	 * @returns {Promise<void>}
+	 */
+	async function removeSelectedAssets(): Promise<void> {
+		const assets = [...selectedAssets];
+		const result = await ModalManager.deleteConfirmationModal(
+			emptyCopy.removeSelectedAssetsConfirm({ count: assets.length }),
+			assets.some((asset) => asset.sourceType !== SourceType.Local)
+		);
+		if (!result.confirmed) return;
+
+		if (result.deleteFile) {
+			for (const asset of assets.filter((asset) => asset.sourceType !== SourceType.Local)) {
+				try {
+					await invoke('delete_file', { path: asset.filePath });
+				} catch (error) {
+					const errorMessage = error instanceof Error ? error.message : String(error);
+					toast.error(get(LL).editor.failedToDeleteFile({ error: errorMessage }));
+				}
+			}
+		}
+
+		ProjectHistoryManager.begin('remove selected assets');
+		try {
+			for (const asset of assets) globalState.currentProject?.content.removeAsset(asset);
+			selectedAssetIds = [];
+		} finally {
+			ProjectHistoryManager.commit();
+		}
+	}
+
+	/**
+	 * Ouvre ou ferme les modes d'ajout à la timeline pour la sélection courante.
+	 * @param {MouseEvent} event Événement utilisé pour positionner le menu.
+	 * @returns {void}
+	 */
+	function openSelectedTimelineContextMenu(event: MouseEvent): void {
+		event.preventDefault();
+		event.stopPropagation();
+		const shouldClose =
+			wasSelectedTimelineContextMenuOpenOnPointerDown ||
+			(selectedTimelineContextMenuElement !== null &&
+				get(currentMenu) === selectedTimelineContextMenuElement);
+		wasSelectedTimelineContextMenuOpenOnPointerDown = false;
+		if (shouldClose) {
+			currentMenu.set(null);
+			return;
+		}
+		selectedTimelineContextMenu?.show(event);
+		selectedTimelineContextMenuElement = get(currentMenu) as HTMLElement | null;
+	}
+
+	/**
+	 * Vérifie qu'un asset média peut être ajouté à la timeline.
+	 * @param {Asset} asset Asset à contrôler.
+	 * @returns {Promise<boolean>} Vrai si l'asset est prêt pour l'ajout.
+	 */
+	async function isAssetReady(asset: Asset): Promise<boolean> {
+		if (!asset.exists) return false;
+		if (asset.type === AssetType.Image) return true;
+
+		await asset.ensureDurationLoaded();
+		if (asset.hasDurationLoadError()) {
+			toast.error(asset.getDurationLoadErrorMessage() || get(LL).editor.unableToAnalyzeMedia());
+			return false;
+		}
+		if (asset.duration.isNull()) {
+			toast.error(get(LL).editor.unableToLoadDuration());
+			return false;
+		}
+		return true;
+	}
+
+	/**
+	 * Ajoute les assets sélectionnés dans les pistes compatibles avec le mode demandé.
+	 * @param {boolean} video Ajouter les flux vidéo compatibles.
+	 * @param {boolean} audio Ajouter les flux audio compatibles.
+	 * @returns {Promise<void>}
+	 */
+	async function addSelectedAssets(video: boolean, audio: boolean): Promise<void> {
+		ProjectHistoryManager.begin('add selected assets to timeline');
+		try {
+			for (const asset of selectedAssets) {
+				const asVideo = video && asset.type !== AssetType.Audio;
+				const asAudio = audio && asset.type !== AssetType.Image;
+				if ((!asVideo && !asAudio) || !(await isAssetReady(asset))) continue;
+				await asset.addToTimeline(asVideo, asAudio);
+			}
+		} finally {
+			ProjectHistoryManager.commit();
+		}
+	}
+</script>
+
+<Section icon="folder_open" name={get(LL).editor.projectAssetsLabel()}>
+	<div bind:this={dropZone}>
+		{#if globalState.currentProject!.content.assets.length === 0}
+			<div class="media-empty-state">
+				<div class="media-empty-icon" aria-hidden="true">
+					<span class="material-icons-outlined">graphic_eq</span>
+				</div>
+				<p class="text-sm font-semibold text-primary">{emptyCopy.mediaEmptyTitle()}</p>
+				<p class="text-xs leading-relaxed text-thirdly">{emptyCopy.mediaEmptyDescription()}</p>
+				<button
+					class="btn-accent mt-2 flex min-h-10 w-full items-center justify-center gap-2 rounded-lg px-4 text-sm font-semibold"
+					type="button"
+					onclick={addAssetButtonClick}
+				>
+					<span class="material-icons-outlined text-lg">add_circle</span>
+					{emptyCopy.addRecitation()}
+				</button>
+			</div>
+		{:else}
+			<div class="mt-1 flex gap-1.5">
+				<button
+					class="btn-accent flex min-w-0 flex-1 items-center justify-center rounded-md px-2.5 py-1.5 text-sm"
+					type="button"
+					onclick={addAssetButtonClick}
+				>
+					<span class="material-icons me-1.5 text-base">add</span>{get(LL).editor.addAssetLabel()}
+				</button>
+				<button
+					class={`btn flex h-10 w-10 shrink-0 items-center justify-center rounded-md ${areAllAssetsSelected ? 'text-accent' : ''}`}
+					type="button"
+					title={areAllAssetsSelected ? get(LL).common.deselectAll() : get(LL).common.selectAll()}
+					onclick={toggleAllAssets}
+				>
+					<span class="material-icons text-xl!"
+						>{areAllAssetsSelected ? 'deselect' : 'select_all'}</span
+					>
+				</button>
+				<button
+					class="btn flex h-10 w-10 shrink-0 items-center justify-center rounded-md"
+					type="button"
+					title={get(LL).editor.deleteSelected()}
+					disabled={selectedAssets.length === 0}
+					onclick={removeSelectedAssets}
+				>
+					<span class="material-icons text-xl!">delete</span>
+				</button>
+			</div>
+
+			{#if selectedAssets.length > 0}
+				<div
+					class="mt-2 rounded-md border border-[var(--accent-primary)]/40 bg-[var(--accent-primary)]/5 p-2"
+				>
+					<div class="flex items-center justify-between gap-2">
+						<span class="truncate text-xs font-medium text-primary">
+							{get(LL).editor.selectedCount({ count: selectedAssets.length })}
+						</span>
+						<button
+							class="flex h-6 w-6 shrink-0 items-center justify-center rounded text-thirdly hover:bg-white/10 hover:text-primary focus-visible:ring-1 focus-visible:ring-[var(--accent-primary)]"
+							type="button"
+							title={get(LL).editor.clearSelection()}
+							onclick={() => (selectedAssetIds = [])}
+						>
+							<span class="material-icons text-sm">close</span>
+						</button>
+					</div>
+					<button
+						class="btn mt-2 flex h-8 w-full items-center justify-center gap-1.5 rounded-md px-2 text-xs font-medium"
+						type="button"
+						onpointerdown={() =>
+							(wasSelectedTimelineContextMenuOpenOnPointerDown =
+								selectedTimelineContextMenuElement !== null &&
+								get(currentMenu) === selectedTimelineContextMenuElement)}
+						onclick={openSelectedTimelineContextMenu}
+					>
+						<span class="material-icons text-lg!">add_to_queue</span>
+						{get(LL).editor.addToTimelineLabel()}
+					</button>
+				</div>
+			{/if}
+
+			<div class="mt-2 flex flex-col gap-1">
+				{#each globalState.currentProject!.content.assets as asset (asset.id)}
+					<AssetViewer
+						{asset}
+						selected={selectedAssetIds.includes(asset.id)}
+						onToggleSelection={() => toggleAssetSelection(asset.id)}
+					/>
+				{/each}
+			</div>
+		{/if}
+	</div>
+</Section>
+
+<ContextMenu bind:this={selectedTimelineContextMenu}>
+	<li class="pointer-events-none px-2 py-1 text-xs font-medium text-thirdly" role="presentation">
+		{get(LL).editor.addToTimelineLabel()}
+	</li>
+	<Item on:click={() => addSelectedAssets(true, true)}>
+		<div class="btn-icon">
+			<span class="material-icons-outlined me-1 text-sm">video_library</span>
+			{get(LL).editor.videoAndAudio()}
+		</div>
+	</Item>
+	{#if hasVideoCompatibleSelection}
+		<Item on:click={() => addSelectedAssets(true, false)}>
+			<div class="btn-icon">
+				<span class="material-icons-outlined me-1 text-sm">videocam</span>
+				{get(LL).editor.videoOnly()}
+			</div>
+		</Item>
+	{/if}
+	{#if hasAudioCompatibleSelection}
+		<Item on:click={() => addSelectedAssets(false, true)}>
+			<div class="btn-icon">
+				<span class="material-icons-outlined me-1 text-sm">music_note</span>
+				{get(LL).editor.audioOnly()}
+			</div>
+		</Item>
+	{/if}
+</ContextMenu>
+
+<style>
+	.media-empty-state {
+		display: flex;
+		min-height: 12rem;
+		flex-direction: column;
+		align-items: center;
+		justify-content: center;
+		gap: 0.45rem;
+		border: 1px dashed color-mix(in srgb, var(--accent-primary) 45%, var(--border-color));
+		border-radius: 0.75rem;
+		padding: 1rem;
+		background: transparent;
+		text-align: center;
+	}
+
+	.media-empty-icon {
+		display: flex;
+		height: 3rem;
+		width: 3rem;
+		align-items: center;
+		justify-content: center;
+		border-radius: 0.9rem;
+		background: color-mix(in srgb, var(--accent-primary) 14%, var(--bg-primary));
+		color: var(--accent-primary);
+	}
+</style>

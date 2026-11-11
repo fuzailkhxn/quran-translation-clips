@@ -1,0 +1,203 @@
+import { invoke } from '@tauri-apps/api/core';
+import { globalState } from '$lib/runes/main.svelte';
+import type { Project } from '$lib/classes/Project';
+import { TrackType } from '$lib/classes/enums';
+import type {
+	AutoSegmentationAudioClip,
+	AutoSegmentationAudioInfo,
+	LocalSegmentationStatus,
+	SegmentationMode
+} from './types';
+import { normalizeSegmentationRiwayah } from './riwayah';
+import { getTimelineClipLayout } from '$lib/components/projectEditor/timeline/track/timelineClipLayout';
+
+/**
+ * Retourne le nombre de sous-pistes audio déduites des chevauchements du projet.
+ * @param {Project | null} project Projet explicite, ou projet global par défaut.
+ * @returns {number} Nombre de sous-pistes audio.
+ */
+export function getAutoSegmentationAudioLaneCount(
+	project: Project | null = globalState.currentProject
+): number {
+	if (!project) return 0;
+	const audioTrack = project.content.timeline.getFirstTrack(TrackType.Audio);
+	return getTimelineClipLayout(
+		audioTrack.clips,
+		(clip) => clip.startTime,
+		(clip) => clip.endTime
+	).laneCount;
+}
+
+/**
+ * Extrait les clips audio présents sur la timeline du projet.
+ *
+ * @param {Project | null} project Projet explicite, ou projet global par défaut.
+ * @param {number} [laneIndex=0] Index de la sous-piste audio sélectionnée.
+ * @returns {AutoSegmentationAudioClip[]} Liste des clips audio de la sous-piste, triés par temps de début.
+ */
+export function getAutoSegmentationAudioClips(
+	project: Project | null = globalState.currentProject,
+	laneIndex: number = 0
+): AutoSegmentationAudioClip[] {
+	if (!project) return [];
+	const audioTrack = project.content.timeline.getFirstTrack(TrackType.Audio);
+	const laneClips = getTimelineClipLayout(
+		audioTrack.clips,
+		(clip) => clip.startTime,
+		(clip) => clip.endTime
+	).clips.filter((positionedClip) => positionedClip.laneIndex === laneIndex);
+
+	const clips: AutoSegmentationAudioClip[] = [];
+
+	for (const { clip } of laneClips) {
+		if (!clip || typeof clip !== 'object') continue;
+
+		const assetId = (clip as { assetId?: unknown }).assetId;
+		if (typeof assetId !== 'number') continue;
+
+		const startTime = (clip as { startTime?: unknown }).startTime;
+		const endTime = (clip as { endTime?: unknown }).endTime;
+		if (typeof startTime !== 'number' || typeof endTime !== 'number') continue;
+		const sourceStartTime = (clip as { sourceStartTime?: unknown }).sourceStartTime;
+
+		const audioAsset = project.content.getAssetById(assetId);
+		const filePath: string | undefined = audioAsset?.filePath;
+		if (!filePath) continue;
+
+		const fileName: string = filePath.split(/[/\\]/).pop() || filePath;
+		const quaMetadata = audioAsset?.metadata?.quranicUniversalAudio;
+		const riwayah = normalizeSegmentationRiwayah(
+			typeof quaMetadata === 'object' && quaMetadata !== null && 'riwayah' in quaMetadata
+				? quaMetadata.riwayah
+				: null
+		);
+		clips.push({
+			filePath,
+			fileName,
+			startMs: Math.max(0, Math.round(startTime)),
+			endMs: Math.max(0, Math.round(endTime)),
+			sourceStartMs:
+				typeof sourceStartTime === 'number' ? Math.max(0, Math.round(sourceStartTime)) : 0,
+			...(riwayah ? { riwayah } : {})
+		});
+	}
+
+	return clips.sort((a, b) => a.startMs - b.startMs);
+}
+
+/**
+ * Récupère les informations du premier clip audio du projet.
+ *
+ * @param {Project | null} project Projet explicite, ou projet global par défaut.
+ * @param {number} [laneIndex=0] Index de la sous-piste audio sélectionnée.
+ * @returns {AutoSegmentationAudioInfo | null} Infos du premier clip, ou null si aucun clip audio.
+ */
+export function getAutoSegmentationAudioInfo(
+	project: Project | null = globalState.currentProject,
+	laneIndex: number = 0
+): AutoSegmentationAudioInfo | null {
+	const clips = getAutoSegmentationAudioClips(project, laneIndex);
+	if (clips.length === 0) return null;
+
+	const first = clips[0];
+	const riwayah = clips.every((clip) => clip.riwayah === first.riwayah) ? first.riwayah : undefined;
+	return {
+		filePath: first.filePath,
+		fileName: first.fileName,
+		clipCount: clips.length,
+		...(riwayah ? { riwayah } : {})
+	};
+}
+
+/**
+ * Calcule la durée totale des clips audio en secondes.
+ *
+ * @param {Project | null} project Projet explicite, ou projet global par défaut.
+ * @param {number} [laneIndex=0] Index de la sous-piste audio sélectionnée.
+ * @returns {number} Durée audio totale en secondes.
+ */
+export function getAutoSegmentationAudioDurationS(
+	project: Project | null = globalState.currentProject,
+	laneIndex: number = 0
+): number {
+	const clips = getAutoSegmentationAudioClips(project, laneIndex);
+	if (clips.length === 0) return 0;
+	const totalMs = clips.reduce((sum, clip) => sum + Math.max(0, clip.endMs - clip.startMs), 0);
+	return totalMs / 1000;
+}
+
+/**
+ * Vérifie si la segmentation locale est disponible et prête.
+ *
+ * @param {string} [hfToken] Token Hugging Face optionnel.
+ * @returns {Promise<LocalSegmentationStatus>} Statut détaillé des moteurs locaux.
+ */
+export async function checkLocalSegmentationStatus(
+	hfToken?: string
+): Promise<LocalSegmentationStatus> {
+	try {
+		const result = await invoke('check_local_segmentation_ready', {
+			hfToken: hfToken && hfToken.trim().length > 0 ? hfToken : undefined
+		});
+		return result as LocalSegmentationStatus;
+	} catch (error) {
+		console.error('Failed to check local segmentation status:', error);
+		return {
+			ready: false,
+			pythonInstalled: false,
+			packagesInstalled: false,
+			message: 'Failed to check local segmentation status',
+			engines: {
+				legacy: {
+					ready: false,
+					venvExists: false,
+					packagesInstalled: false,
+					usable: false,
+					message: 'Status check failed'
+				},
+				multi: {
+					ready: false,
+					venvExists: false,
+					packagesInstalled: false,
+					usable: false,
+					tokenRequired: true,
+					tokenProvided: false,
+					message: 'Status check failed'
+				}
+			}
+		};
+	}
+}
+
+/**
+ * Installe les dépendances pour la segmentation locale.
+ *
+ * @param {'legacy' | 'multi' | 'quran_word_timing'} engine Moteur cible.
+ * @param {string} [hfToken] Token Hugging Face optionnel.
+ * @returns {Promise<void>}
+ */
+export async function installLocalSegmentationDeps(
+	engine: 'legacy' | 'multi' | 'quran_word_timing',
+	hfToken?: string
+): Promise<void> {
+	try {
+		await invoke('install_local_segmentation_deps', {
+			engine,
+			hfToken: hfToken && hfToken.trim().length > 0 ? hfToken : undefined
+		});
+	} catch (error) {
+		console.error('Failed to install local segmentation deps:', error);
+		throw error;
+	}
+}
+
+/**
+ * Récupère le mode de segmentation préféré.
+ * Retourne 'local' si prêt, sinon 'api'.
+ *
+ * @returns {Promise<SegmentationMode>} Mode de segmentation préféré.
+ */
+export async function getPreferredSegmentationMode(): Promise<SegmentationMode> {
+	const status = await checkLocalSegmentationStatus();
+	return status.ready ? 'local' : 'api';
+}

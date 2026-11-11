@@ -1,0 +1,386 @@
+<script lang="ts">
+	import LL from '$lib/i18n/i18n-svelte';
+	import { ClipWithTranslation } from '$lib/classes/Clip.svelte';
+	import { VerseTranslation } from '$lib/classes/Translation.svelte';
+	import { globalState } from '$lib/runes/main.svelte';
+	import ModalManager from '$lib/components/modals/ModalManager';
+	import Settings from '$lib/classes/Settings.svelte';
+	import { WBW_TRANSLATION_LANGUAGES } from '$lib/services/WbwTranslationService';
+
+	const translationsEditorState = $derived(
+		() => globalState.currentProject!.projectEditorState.translationsEditor
+	);
+
+	const hasActiveInlineStyle = $derived(
+		() =>
+			translationsEditorState().inlineStyleBoldEnabled ||
+			translationsEditorState().inlineStyleItalicEnabled ||
+			translationsEditorState().inlineStyleUnderlineEnabled ||
+			translationsEditorState().inlineStyleLineBreakEnabled ||
+			translationsEditorState().inlineStyleColorEnabled ||
+			translationsEditorState().inlineStyleGlowEnabled
+	);
+
+	function toggleStyle(
+		property:
+			| 'inlineStyleBoldEnabled'
+			| 'inlineStyleItalicEnabled'
+			| 'inlineStyleUnderlineEnabled'
+			| 'inlineStyleLineBreakEnabled'
+			| 'inlineStyleColorEnabled'
+			| 'inlineStyleGlowEnabled'
+	): void {
+		translationsEditorState()[property] = !translationsEditorState()[property];
+	}
+
+	/**
+	 * Active ou désactive un mode d'édition de traduction exclusif.
+	 *
+	 * @param {'inline' | 'wbw'} mode Mode demandé par l'utilisateur.
+	 * @returns {void}
+	 */
+	function toggleExclusiveMode(mode: 'inline' | 'wbw'): void {
+		if (mode === 'inline') {
+			translationsEditorState().isInlineStyleMode = !translationsEditorState().isInlineStyleMode;
+			if (translationsEditorState().isInlineStyleMode) {
+				translationsEditorState().isTranslationWbwMappingMode = false;
+			}
+			return;
+		}
+
+		translationsEditorState().isTranslationWbwMappingMode =
+			!translationsEditorState().isTranslationWbwMappingMode;
+		if (translationsEditorState().isTranslationWbwMappingMode) {
+			translationsEditorState().isInlineStyleMode = false;
+		}
+	}
+
+	async function resetAllInlineStyles(): Promise<void> {
+		const confirm = await ModalManager.confirmModal($LL.translations.resetInlineStylesConfirm());
+
+		if (!confirm) return;
+
+		for (const clip of globalState.getSubtitleTrack.clips) {
+			if (clip instanceof ClipWithTranslation) {
+				for (const translation of Object.values(clip.translations || {})) {
+					if (
+						translation instanceof VerseTranslation &&
+						(translation.inlineStyleRuns?.length ?? 0) > 0
+					) {
+						translation.clearInlineStyles();
+					}
+				}
+			}
+
+			if (clip instanceof ClipWithTranslation && (clip.arabicInlineStyleRuns?.length ?? 0) > 0) {
+				clip.clearArabicInlineStyles();
+			}
+		}
+
+		globalState.updateVideoPreviewUI();
+	}
+</script>
+
+<div class="px-4 py-4 border-b border-color bg-primary/70">
+	<div class="flex items-start gap-3">
+		<div class="min-w-0">
+			<h3 class="text-sm font-semibold text-primary">{$LL.editor.wordStyles()}</h3>
+			<p class="text-xs text-thirdly mt-1 leading-relaxed">
+				{$LL.editor.wordStylesDescription()}
+			</p>
+		</div>
+	</div>
+</div>
+
+<div class="flex-1 overflow-y-auto px-4 py-4 space-y-4">
+	<button
+		class={`w-full rounded-xl border px-3 py-3 text-start transition-all duration-200 ${
+			translationsEditorState().isInlineStyleMode
+				? 'border-[var(--accent-primary)] bg-[color-mix(in_srgb,var(--accent-primary)_12%,var(--bg-secondary))] text-primary'
+				: 'border-color bg-accent text-secondary hover:border-[var(--accent-primary)]/45 hover:text-primary'
+		}`}
+		onclick={() => toggleExclusiveMode('inline')}
+	>
+		<div class="flex items-center justify-between gap-3">
+			<div>
+				<p class="text-sm font-semibold">{$LL.editor.wordStyleEditing()}</p>
+				<p class="text-xs mt-1 opacity-80">
+					{translationsEditorState().isInlineStyleMode
+						? $LL.common.enabled()
+						: $LL.common.disabled()}
+				</p>
+			</div>
+			<span class="material-icons text-lg">
+				{translationsEditorState().isInlineStyleMode ? 'visibility' : 'edit_note'}
+			</span>
+		</div>
+	</button>
+
+	<button
+		class={`w-full rounded-xl border px-3 py-3 text-start transition-all duration-200 ${
+			translationsEditorState().isTranslationWbwMappingMode
+				? 'border-[var(--accent-primary)] bg-[color-mix(in_srgb,var(--accent-primary)_12%,var(--bg-secondary))] text-primary'
+				: 'border-color bg-accent text-secondary hover:border-[var(--accent-primary)]/45 hover:text-primary'
+		}`}
+		onclick={() => toggleExclusiveMode('wbw')}
+	>
+		<div class="flex items-center justify-between gap-3">
+			<div>
+				<p class="text-sm font-semibold">{$LL.editor.translationWbwMapping()}</p>
+				<p class="text-xs mt-1 opacity-80">
+					{translationsEditorState().isTranslationWbwMappingMode
+						? $LL.common.enabled()
+						: $LL.common.disabled()}
+				</p>
+			</div>
+			<span class="material-icons text-lg">
+				{translationsEditorState().isTranslationWbwMappingMode ? 'link' : 'add_link'}
+			</span>
+		</div>
+	</button>
+
+	{#if translationsEditorState().isTranslationWbwMappingMode}
+		<div
+			class="rounded-xl border border-color bg-accent px-3 py-3 text-xs text-secondary leading-relaxed"
+		>
+			{$LL.editor.translationWbwMappingDescription()}
+		</div>
+
+		<div class="rounded-xl border border-color bg-accent overflow-hidden">
+			<div class="px-4 py-4 border-b border-color bg-primary/40">
+				<div class="text-sm font-semibold text-primary">
+					{$LL.editor.aiWbwTranslationAssistant()}
+				</div>
+			</div>
+
+			<div class="space-y-4 p-4">
+				<button
+					class="w-full rounded-lg bg-[var(--accent-primary)] px-4 py-3 text-sm font-semibold text-black transition-all duration-200 hover:brightness-110"
+					onclick={() => void ModalManager.aiWbwTranslationModal()}
+				>
+					{$LL.editor.openAiWbwTranslationAssistant()}
+				</button>
+			</div>
+		</div>
+	{/if}
+
+	{#if translationsEditorState().isInlineStyleMode}
+		<div class="space-y-2">
+			<p class="text-[11px] font-semibold uppercase tracking-[0.18em] text-thirdly">
+				{$LL.editor.stylesToToggle()}
+			</p>
+
+			<button
+				class={`w-full rounded-lg border px-3 py-2.5 text-sm font-medium transition-all duration-200 flex items-center justify-between ${
+					translationsEditorState().inlineStyleBoldEnabled
+						? 'border-[var(--accent-primary)] bg-[color-mix(in_srgb,var(--accent-primary)_12%,var(--bg-secondary))] text-primary'
+						: 'border-color bg-accent text-secondary hover:text-primary'
+				}`}
+				onclick={() => toggleStyle('inlineStyleBoldEnabled')}
+			>
+				<span class="flex items-center gap-2">
+					<span class="material-icons text-base">format_bold</span>
+					{$LL.editor.bold()}
+				</span>
+				<span class="text-xs"
+					>{translationsEditorState().inlineStyleBoldEnabled
+						? $LL.common.on()
+						: $LL.common.off()}</span
+				>
+			</button>
+
+			<button
+				class={`w-full rounded-lg border px-3 py-2.5 text-sm font-medium transition-all duration-200 flex items-center justify-between ${
+					translationsEditorState().inlineStyleItalicEnabled
+						? 'border-[var(--accent-primary)] bg-[color-mix(in_srgb,var(--accent-primary)_12%,var(--bg-secondary))] text-primary'
+						: 'border-color bg-accent text-secondary hover:text-primary'
+				}`}
+				onclick={() => toggleStyle('inlineStyleItalicEnabled')}
+			>
+				<span class="flex items-center gap-2">
+					<span class="material-icons text-base">format_italic</span>
+					{$LL.editor.italic()}
+				</span>
+				<span class="text-xs"
+					>{translationsEditorState().inlineStyleItalicEnabled
+						? $LL.common.on()
+						: $LL.common.off()}</span
+				>
+			</button>
+
+			<button
+				class={`w-full rounded-lg border px-3 py-2.5 text-sm font-medium transition-all duration-200 flex items-center justify-between ${
+					translationsEditorState().inlineStyleUnderlineEnabled
+						? 'border-[var(--accent-primary)] bg-[color-mix(in_srgb,var(--accent-primary)_12%,var(--bg-secondary))] text-primary'
+						: 'border-color bg-accent text-secondary hover:text-primary'
+				}`}
+				onclick={() => toggleStyle('inlineStyleUnderlineEnabled')}
+			>
+				<span class="flex items-center gap-2">
+					<span class="material-icons text-base">format_underlined</span>
+					{$LL.editor.underline()}
+				</span>
+				<span class="text-xs"
+					>{translationsEditorState().inlineStyleUnderlineEnabled
+						? $LL.common.on()
+						: $LL.common.off()}</span
+				>
+			</button>
+
+			<button
+				class={`w-full rounded-lg border px-3 py-2.5 text-sm font-medium transition-all duration-200 flex items-center justify-between ${
+					translationsEditorState().inlineStyleLineBreakEnabled
+						? 'border-[var(--accent-primary)] bg-[color-mix(in_srgb,var(--accent-primary)_12%,var(--bg-secondary))] text-primary'
+						: 'border-color bg-accent text-secondary hover:text-primary'
+				}`}
+				onclick={() => toggleStyle('inlineStyleLineBreakEnabled')}
+			>
+				<span class="flex items-center gap-2">
+					<span class="material-icons text-base">keyboard_return</span>
+					{$LL.editor.newLine()}
+				</span>
+				<span class="text-xs"
+					>{translationsEditorState().inlineStyleLineBreakEnabled
+						? $LL.common.on()
+						: $LL.common.off()}</span
+				>
+			</button>
+
+			<div
+				class={`rounded-lg border px-3 py-1 transition-all duration-200 ${
+					translationsEditorState().inlineStyleColorEnabled
+						? 'border-[var(--accent-primary)] bg-[color-mix(in_srgb,var(--accent-primary)_12%,var(--bg-secondary))]'
+						: 'border-color bg-accent'
+				}`}
+			>
+				<div class="flex items-center justify-between gap-3">
+					<button
+						class="flex min-w-0 flex-1 items-center justify-between gap-3 text-start text-sm font-medium text-primary"
+						onclick={() => toggleStyle('inlineStyleColorEnabled')}
+					>
+						<span class="flex items-center gap-2">
+							<span
+								class="inline-block h-4 w-4 rounded-full border border-white/20 shadow-sm"
+								style={`background-color: ${translationsEditorState().inlineStyleColorValue};`}
+							></span>
+							{$LL.editor.color()}
+						</span>
+
+						<div class="flex items-center gap-x-2">
+							<input
+								type="color"
+								value={translationsEditorState().inlineStyleColorValue}
+								onclick={(event) => event.stopPropagation()}
+								oninput={(event) => {
+									translationsEditorState().inlineStyleColorValue = (
+										event.currentTarget as HTMLInputElement
+									).value;
+								}}
+								class="h-9 w-11 cursor-pointer rounded border border-color bg-secondary p-1"
+								aria-label={$LL.editor.wordStyleColor()}
+							/>
+
+							<span class="text-xs text-secondary">
+								{translationsEditorState().inlineStyleColorEnabled
+									? $LL.common.on()
+									: $LL.common.off()}
+							</span>
+						</div>
+					</button>
+				</div>
+			</div>
+
+			<div
+				class={`rounded-lg border px-3 py-1 transition-all duration-200 ${
+					translationsEditorState().inlineStyleGlowEnabled
+						? 'border-[var(--accent-primary)] bg-[color-mix(in_srgb,var(--accent-primary)_12%,var(--bg-secondary))]'
+						: 'border-color bg-accent'
+				}`}
+			>
+				<div class="flex items-center justify-between gap-3">
+					<button
+						class="flex min-w-0 flex-1 items-center justify-between gap-3 text-start text-sm font-medium text-primary"
+						onclick={() => toggleStyle('inlineStyleGlowEnabled')}
+					>
+						<span class="flex items-center gap-2">
+							<span
+								class="inline-block h-4 w-4 rounded-full border border-white/20"
+								style={`background-color: ${translationsEditorState().inlineStyleGlowColorValue}; box-shadow: 0 0 8px ${translationsEditorState().inlineStyleGlowColorValue};`}
+							></span>
+							{$LL.editor.styleName['text-glow']()}
+						</span>
+
+						<div class="flex items-center gap-x-2">
+							<input
+								type="color"
+								value={translationsEditorState().inlineStyleGlowColorValue}
+								onclick={(event) => event.stopPropagation()}
+								oninput={(event) => {
+									translationsEditorState().inlineStyleGlowColorValue = (
+										event.currentTarget as HTMLInputElement
+									).value;
+								}}
+								class="h-9 w-11 cursor-pointer rounded border border-color bg-secondary p-1"
+								aria-label={$LL.editor.styleName['text-glow-color']()}
+							/>
+
+							<span class="text-xs text-secondary">
+								{translationsEditorState().inlineStyleGlowEnabled
+									? $LL.common.on()
+									: $LL.common.off()}
+							</span>
+						</div>
+					</button>
+				</div>
+			</div>
+		</div>
+
+		<div
+			class="rounded-xl border border-color bg-accent px-3 py-3 text-xs text-secondary leading-relaxed space-y-2"
+		>
+			<p class="font-semibold text-primary">{$LL.editor.howItWorks()}</p>
+			<p>
+				{$LL.editor.howItWorksDescription1()}
+			</p>
+			<p>
+				{$LL.editor.howItWorksDescription2()}
+			</p>
+			{#if !hasActiveInlineStyle()}
+				<p class="text-[var(--accent-primary)]">{$LL.editor.selectAtLeastOneStyle()}</p>
+			{/if}
+		</div>
+
+		<div class="rounded-xl border border-color bg-accent p-3 space-y-2">
+			<p class="text-[11px] font-semibold uppercase tracking-[0.18em] text-thirdly">
+				{$LL.editor.globalActions()}
+			</p>
+			<button
+				class="w-full rounded-lg border border-red-500/35 bg-red-500/10 px-3 py-2.5 text-sm font-semibold text-red-300 transition hover:bg-red-500/20 disabled:cursor-not-allowed disabled:opacity-45"
+				onclick={resetAllInlineStyles}
+			>
+				{$LL.editor.resetAllSegmentStyles()}
+			</button>
+		</div>
+
+		<div class="rounded-xl border border-color bg-accent overflow-hidden">
+			<div class="px-4 py-4 border-b border-color bg-primary/40">
+				<div class="flex items-start justify-between gap-3">
+					<div>
+						<div class="text-sm font-semibold text-primary">
+							{$LL.editor.aiAssistedWordEmphasis()}
+						</div>
+					</div>
+				</div>
+			</div>
+
+			<div class="space-y-4 p-4">
+				<button
+					class="w-full rounded-lg bg-[var(--accent-primary)] px-4 py-3 text-sm font-semibold text-black transition-all duration-200 hover:brightness-110"
+					onclick={() => void ModalManager.aiBoldModal()}
+				>
+					{$LL.editor.openAiBoldAssistant()}
+				</button>
+			</div>
+		</div>
+	{/if}
+</div>

@@ -1,0 +1,598 @@
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
+import Exporter, {
+	DEFAULT_YTB_CHAPTERS_FORMAT,
+	formatYouTubeChapterLine,
+	getRandomBackgroundCandidates,
+	prepareRandomBackgroundProject,
+	resolveProjectVideoExportRange,
+	selectRandomBackgroundCandidate,
+	type YouTubeChapterFormatValues
+} from '$lib/classes/Exporter';
+import {
+	AssetClip,
+	AssetType,
+	Batch,
+	Category,
+	Style,
+	StylesData,
+	SubtitleClip,
+	TrackType,
+	type Project
+} from '$lib/classes';
+import { BatchService } from '$lib/services/BatchService';
+import { ProjectService } from '$lib/services/ProjectService';
+import ExportFileService from '$lib/services/ExportFileService';
+import { ExportMediaInputBuilder } from '../../../../src/routes/exporter/ExportMediaInputBuilder';
+import { globalState } from '$lib/runes/main.svelte';
+import ExportService from '$lib/services/ExportService';
+import Exportation, { ExportKind, ExportState } from '$lib/classes/Exportation.svelte';
+
+afterEach(() => vi.restoreAllMocks());
+
+const baseValues: YouTubeChapterFormatValues = {
+	timestamp: '0:03',
+	surahNumber: 20,
+	surahTranslation: 'Ta-Ha',
+	surahTransliteration: 'Taha',
+	verseArabic: 'طه',
+	verseNumber: 2,
+	hizbNumber: 32,
+	juzNumber: 16,
+	rubNumber: 127,
+	verseTranslation: 'We have not sent down to you the Quran that you be distressed'
+};
+
+describe('Stalled capture guard', () => {
+	it.each([
+		[ExportKind.Video, ExportState.CapturingFrames, 0, true],
+		[ExportKind.Video, ExportState.CapturingFrames, 1, false],
+		[ExportKind.Video, ExportState.WaitingForRecord, 0, false],
+		[ExportKind.Video, ExportState.Initializing, 0, false],
+		[ExportKind.Video, ExportState.CreatingVideo, 0, false],
+		[ExportKind.Image, ExportState.CapturingFrames, 0, false]
+	])('guards %s / %s / %i frames', async (exportKind, currentState, capturedFrames, cancels) => {
+		Reflect.get(Exporter, 'zeroFrameCaptureStartedAt').clear();
+		Reflect.get(Exporter, 'retriedCaptureIds').clear();
+		const exp = { exportId: 123, exportKind, currentState, capturedFrames, cancelExport: vi.fn() };
+		vi.spyOn(ExportService, 'currentlyExportingProjects').mockReturnValue([
+			exp as unknown as Exportation
+		]);
+		const save = vi.spyOn(ExportService, 'saveExports').mockResolvedValue(undefined);
+		const now = vi.spyOn(performance, 'now').mockReturnValue(0);
+
+		await Reflect.get(Exporter, 'cancelStalledCaptures')();
+		now.mockReturnValue(29_999);
+		await Reflect.get(Exporter, 'cancelStalledCaptures')();
+		expect(exp.cancelExport).not.toHaveBeenCalled();
+		now.mockReturnValue(30_000);
+		await Reflect.get(Exporter, 'cancelStalledCaptures')();
+		expect(exp.cancelExport).toHaveBeenCalledTimes(cancels ? 1 : 0);
+		expect(save).toHaveBeenCalledTimes(cancels ? 1 : 0);
+		if (cancels) {
+			expect(exp.cancelExport).toHaveBeenCalledWith('export_monitor', true);
+			expect(exp.currentState).toBe(ExportState.WaitingForRecord);
+		}
+	});
+
+	it('reopens a stalled export once through the queue and cancels a second stall', async () => {
+		Reflect.get(Exporter, 'zeroFrameCaptureStartedAt').clear();
+		Reflect.get(Exporter, 'retriedCaptureIds').clear();
+		const exp = {
+			exportId: 123,
+			exportKind: ExportKind.Video,
+			currentState: ExportState.CapturingFrames,
+			capturedFrames: 0,
+			cancelExport: vi.fn(async () => {
+				exp.currentState = ExportState.Canceled;
+			})
+		};
+		vi.spyOn(ExportService, 'currentlyExportingProjects').mockReturnValue([
+			exp as unknown as Exportation
+		]);
+		vi.spyOn(ExportService, 'saveExports').mockResolvedValue(undefined);
+		const open = vi.spyOn(Exporter as never, 'openExportWindow').mockResolvedValue(undefined);
+		const now = vi.spyOn(performance, 'now').mockReturnValue(0);
+		const previousExports = globalState.exportations;
+		globalState.exportations = [exp as unknown as Exportation];
+		try {
+			await Reflect.get(Exporter, 'processExportQueue')();
+			now.mockReturnValue(30_000);
+			await Reflect.get(Exporter, 'processExportQueue')();
+			expect(open).toHaveBeenCalledExactlyOnceWith('123');
+			expect(exp.currentState).toBe(ExportState.CapturingFrames);
+			now.mockReturnValue(30_750);
+			await Reflect.get(Exporter, 'processExportQueue')();
+			now.mockReturnValue(60_750);
+			await Reflect.get(Exporter, 'processExportQueue')();
+			expect(exp.cancelExport.mock.calls).toEqual([
+				['export_monitor', true],
+				['export_monitor', false]
+			]);
+			expect(exp.currentState).toBe(ExportState.Canceled);
+			expect(open).toHaveBeenCalledTimes(1);
+		} finally {
+			globalState.exportations = previousExports;
+		}
+	});
+
+	it('resets the timeout when capture ends and ignores exports no longer owned', async () => {
+		Reflect.get(Exporter, 'zeroFrameCaptureStartedAt').clear();
+		const exp = {
+			exportId: 123,
+			exportKind: ExportKind.Video,
+			currentState: ExportState.CapturingFrames,
+			capturedFrames: 0,
+			cancelExport: vi.fn()
+		};
+		const owned = vi
+			.spyOn(ExportService, 'currentlyExportingProjects')
+			.mockReturnValue([exp as unknown as Exportation]);
+		const now = vi.spyOn(performance, 'now').mockReturnValue(0);
+		await Reflect.get(Exporter, 'cancelStalledCaptures')();
+		now.mockReturnValue(20_000);
+		exp.currentState = ExportState.CreatingVideo;
+		await Reflect.get(Exporter, 'cancelStalledCaptures')();
+		exp.currentState = ExportState.CapturingFrames;
+		await Reflect.get(Exporter, 'cancelStalledCaptures')();
+		now.mockReturnValue(30_000);
+		await Reflect.get(Exporter, 'cancelStalledCaptures')();
+		expect(exp.cancelExport).not.toHaveBeenCalled();
+		owned.mockReturnValue([]);
+		now.mockReturnValue(60_000);
+		await Reflect.get(Exporter, 'cancelStalledCaptures')();
+		expect(exp.cancelExport).not.toHaveBeenCalled();
+		expect(Reflect.get(Exporter, 'zeroFrameCaptureStartedAt').size).toBe(0);
+	});
+});
+
+describe('YouTube chapter formatting', () => {
+	it('keeps the default chapter output shape', () => {
+		expect(formatYouTubeChapterLine(DEFAULT_YTB_CHAPTERS_FORMAT, baseValues)).toBe(
+			'0:03 Surah 20, Verse 2'
+		);
+	});
+
+	it('replaces verse placeholders in a custom format', () => {
+		const line = formatYouTubeChapterLine(
+			'<timestamp> <surah-number>:<verse-number> <verse-arabic> - <verse-translation>',
+			baseValues
+		);
+
+		expect(line).toBe(
+			'0:03 20:2 طه - We have not sent down to you the Quran that you be distressed'
+		);
+	});
+
+	it('replaces surah name placeholders', () => {
+		const line = formatYouTubeChapterLine(
+			'<timestamp> <surah-transliteration> / <surah-translation>',
+			baseValues
+		);
+
+		expect(line).toBe('0:03 Taha / Ta-Ha');
+	});
+
+	it('replaces Quran division placeholders', () => {
+		const line = formatYouTubeChapterLine(
+			'<timestamp> Hizb <hizb-number> Juz <juz-number> Rub <rub-number>',
+			baseValues
+		);
+
+		expect(line).toBe('0:03 Hizb 32 Juz 16 Rub 127');
+	});
+
+	it('keeps unknown placeholders and supports blank verse translations', () => {
+		const line = formatYouTubeChapterLine('<timestamp> <verse-translation> <unknown>', {
+			...baseValues,
+			verseTranslation: ''
+		});
+
+		expect(line).toBe('0:03  <unknown>');
+	});
+});
+
+describe('Project video export range', () => {
+	it('keeps a project-specific range lasting at least one second', () => {
+		expect(resolveProjectVideoExportRange(1_250, 5_250, 10_000)).toEqual([1_250, 5_250]);
+	});
+
+	it('uses the full audio duration when the project range is shorter than one second', () => {
+		expect(resolveProjectVideoExportRange(500, 1_400, 10_000)).toEqual([0, 10_000]);
+		expect(resolveProjectVideoExportRange(0, 0, 10_000)).toEqual([0, 10_000]);
+	});
+});
+
+/**
+ * Construit un projet minimal pour tester la préparation d'un export vidéo.
+ * @param {{ addRandomBackground?: boolean; exportWithoutBackground?: boolean; videoClips?: AssetClip[] }} options Options de l'état d'export et de la piste vidéo.
+ * @returns {{ project: Project; videoTrack: { clips: AssetClip[] }; addAssetHeadless: ReturnType<typeof vi.fn> }} Projet et dépendances observables.
+ */
+function createRandomBackgroundProjectFixture(
+	options: {
+		addRandomBackground?: boolean;
+		exportWithoutBackground?: boolean;
+		videoClips?: AssetClip[];
+	} = {}
+) {
+	const videoTrack = { clips: options.videoClips ?? [] };
+	const audioTrack = { getDuration: () => ({ ms: 5000 }) };
+	const addAssetHeadless = vi.fn();
+	const project = {
+		projectEditorState: {
+			export: {
+				addRandomBackground: options.addRandomBackground ?? true,
+				exportWithoutBackground: options.exportWithoutBackground ?? false
+			}
+		},
+		content: {
+			timeline: {
+				getFirstTrack: vi.fn((trackType: TrackType) =>
+					trackType === TrackType.Video ? videoTrack : audioTrack
+				)
+			},
+			addAssetHeadless
+		}
+	} as unknown as Project;
+
+	return { project, videoTrack, addAssetHeadless };
+}
+
+describe('Random export backgrounds', () => {
+	it('filters compatible files without entering subdirectories', () => {
+		const entries = [
+			{ name: 'image.PNG', isFile: true, isDirectory: false },
+			{ name: 'clip.webm', isFile: true, isDirectory: false },
+			{ name: 'audio.mp3', isFile: true, isDirectory: false },
+			{ name: 'notes.txt', isFile: true, isDirectory: false },
+			{ name: 'nested', isFile: false, isDirectory: true }
+		];
+
+		expect(getRandomBackgroundCandidates(entries)).toEqual(['image.PNG', 'clip.webm']);
+	});
+
+	it('selects candidates independently from the random value', () => {
+		const entries = [
+			{ name: 'first.jpg', isFile: true, isDirectory: false },
+			{ name: 'second.mp4', isFile: true, isDirectory: false }
+		];
+
+		expect(selectRandomBackgroundCandidate(entries, 0)).toBe('first.jpg');
+		expect(selectRandomBackgroundCandidate(entries, 0.99)).toBe('second.mp4');
+	});
+
+	it('does nothing when the option is disabled or the video track is not empty', async () => {
+		const disabled = createRandomBackgroundProjectFixture({ addRandomBackground: false });
+		const disabledReader = vi.fn(async () => []);
+		await prepareRandomBackgroundProject(disabled.project, 'pool', {
+			readDirectory: disabledReader
+		});
+		expect(disabled.videoTrack.clips).toHaveLength(0);
+		expect(disabledReader).not.toHaveBeenCalled();
+
+		const existing = createRandomBackgroundProjectFixture({
+			videoClips: [new AssetClip(0, 100, 4)]
+		});
+		const existingReader = vi.fn(async () => []);
+		await prepareRandomBackgroundProject(existing.project, 'pool', {
+			readDirectory: existingReader
+		});
+		expect(existing.videoTrack.clips).toHaveLength(1);
+		expect(existingReader).not.toHaveBeenCalled();
+	});
+
+	it('falls back silently for an empty, inaccessible, or invalid pool', async () => {
+		const empty = createRandomBackgroundProjectFixture();
+		await prepareRandomBackgroundProject(empty.project, 'pool', {
+			readDirectory: async () => [{ name: 'sound.mp3', isFile: true, isDirectory: false }]
+		});
+		expect(empty.videoTrack.clips).toHaveLength(0);
+
+		const inaccessible = createRandomBackgroundProjectFixture();
+		await prepareRandomBackgroundProject(inaccessible.project, 'pool', {
+			readDirectory: async () => {
+				throw new Error('access denied');
+			}
+		});
+		expect(inaccessible.videoTrack.clips).toHaveLength(0);
+
+		const invalid = createRandomBackgroundProjectFixture();
+		await prepareRandomBackgroundProject(invalid.project, 'pool', {
+			readDirectory: async () => [{ name: 'broken.jpg', isFile: true, isDirectory: false }]
+		});
+		expect(invalid.videoTrack.clips).toHaveLength(0);
+	});
+
+	it('creates a non-looping image clip', async () => {
+		const fixture = createRandomBackgroundProjectFixture();
+		const asset = {
+			id: 7,
+			type: AssetType.Image,
+			exists: true,
+			checkExistence: vi.fn(async () => undefined),
+			ensureDurationLoaded: vi.fn(async () => undefined),
+			hasDurationLoadError: vi.fn(() => false)
+		};
+		fixture.addAssetHeadless.mockReturnValue(asset);
+
+		await prepareRandomBackgroundProject(fixture.project, 'pool', {
+			readDirectory: async () => [{ name: 'background.jpg', isFile: true, isDirectory: false }],
+			joinPath: async (folder, fileName) => `${folder}/${fileName}`
+		});
+
+		expect(fixture.videoTrack.clips[0]).toMatchObject({
+			assetId: 7,
+			startTime: 0,
+			endTime: 0,
+			loopUntilAudioEnd: false
+		});
+	});
+
+	it('creates a looping video clip covering the audio duration', async () => {
+		const fixture = createRandomBackgroundProjectFixture();
+		const asset = {
+			id: 8,
+			type: AssetType.Video,
+			exists: true,
+			checkExistence: vi.fn(async () => undefined),
+			ensureDurationLoaded: vi.fn(async () => undefined),
+			hasDurationLoadError: vi.fn(() => false)
+		};
+		fixture.addAssetHeadless.mockReturnValue(asset);
+
+		await prepareRandomBackgroundProject(fixture.project, 'pool', {
+			readDirectory: async () => [{ name: 'background.mp4', isFile: true, isDirectory: false }],
+			joinPath: async (folder, fileName) => `${folder}/${fileName}`
+		});
+
+		expect(asset.ensureDurationLoaded).toHaveBeenCalledOnce();
+		expect(fixture.videoTrack.clips[0]).toMatchObject({
+			assetId: 8,
+			startTime: 0,
+			endTime: 5000,
+			loopUntilAudioEnd: true
+		});
+	});
+
+	it('does not add a background when transparent export is enabled', async () => {
+		const fixture = createRandomBackgroundProjectFixture({ exportWithoutBackground: true });
+		const reader = vi.fn(async () => [
+			{ name: 'background.jpg', isFile: true, isDirectory: false }
+		]);
+
+		await prepareRandomBackgroundProject(fixture.project, 'pool', { readDirectory: reader });
+
+		expect(reader).not.toHaveBeenCalled();
+		expect(fixture.videoTrack.clips).toHaveLength(0);
+	});
+});
+
+describe('Background media export inputs', () => {
+	it('rounds audio and video timings while preserving fractional volume', () => {
+		const previousProject = globalState.currentProject;
+		const clip = new AssetClip(1000.25, 8030.75, 10);
+		clip.sourceStartTime = 7.75;
+		clip.volumePercent = 89.5;
+		globalState.currentProject = {
+			content: {
+				timeline: { getFirstTrack: () => ({ clips: [clip] }) },
+				getAssetById: () => ({ filePath: 'media.mp4', type: AssetType.Video })
+			}
+		} as unknown as Project;
+
+		try {
+			expect(ExportMediaInputBuilder.getVideoInputs()).toEqual([
+				{
+					path: 'media.mp4',
+					loop_until_audio_end: false,
+					source_start_ms: 8,
+					timeline_start_ms: 1000,
+					duration_ms: 7031
+				}
+			]);
+			expect(ExportMediaInputBuilder.getAudioInputs()).toEqual({
+				audios: ['media.mp4'],
+				audioClips: [
+					{
+						path: 'media.mp4',
+						source_start_ms: 8,
+						timeline_start_ms: 1000,
+						duration_ms: 7031,
+						volume_percent: 89.5
+					}
+				]
+			});
+		} finally {
+			globalState.currentProject = previousProject;
+		}
+	});
+
+	it.each([
+		[7030.08547008544, 7030],
+		[7030.9, 7031],
+		[0, 7030]
+	])('exports integer image zoom durations for a %s ms clip', (duration, expectedZoomDuration) => {
+		const previousProject = globalState.currentProject;
+		const imageClip = new AssetClip(0, duration, 11);
+		imageClip.animateImageZoom = true;
+		imageClip.imageZoomEnd = 1.75;
+		globalState.currentProject = {
+			content: {
+				timeline: {
+					getFirstTrack: () => ({ clips: [imageClip] }),
+					getLongestTrackDurationIgnoringLoopedVideo: () => ({ ms: 7030.08547008544 })
+				},
+				getAssetById: () => ({ filePath: 'still.png', type: AssetType.Image })
+			}
+		} as unknown as Project;
+
+		try {
+			expect(ExportMediaInputBuilder.getVideoInputs()).toEqual([
+				{
+					path: 'still.png',
+					loop_until_audio_end: false,
+					source_start_ms: 0,
+					timeline_start_ms: 0,
+					duration_ms: Math.round(duration),
+					image_zoom_duration_ms: expectedZoomDuration,
+					image_zoom_end: 1.75
+				}
+			]);
+			expect(imageClip.duration).toBe(duration);
+		} finally {
+			globalState.currentProject = previousProject;
+		}
+	});
+
+	it('exports timed image clips with their timeline duration', () => {
+		const previousProject = globalState.currentProject;
+		const videoClip = new AssetClip(0, 5_000, 10);
+		const imageClip = new AssetClip(5_001, 15_001, 11);
+		imageClip.animateImageZoom = true;
+		imageClip.imageZoomEnd = 2;
+		const assets = new Map([
+			[
+				10,
+				{
+					filePath: 'background.mp4',
+					type: AssetType.Video,
+					duration: { ms: 5_000 }
+				}
+			],
+			[
+				11,
+				{
+					filePath: 'still.png',
+					type: AssetType.Image,
+					duration: { ms: 0 }
+				}
+			]
+		]);
+		globalState.currentProject = {
+			content: {
+				timeline: { getFirstTrack: () => ({ clips: [videoClip, imageClip] }) },
+				getAssetById: (id: number) => assets.get(id)
+			}
+		} as unknown as Project;
+
+		try {
+			expect(ExportMediaInputBuilder.getVideoInputs()).toEqual([
+				{
+					path: 'background.mp4',
+					loop_until_audio_end: false,
+					source_start_ms: 0,
+					timeline_start_ms: 0,
+					duration_ms: 5_000
+				},
+				{
+					path: 'still.png',
+					loop_until_audio_end: false,
+					source_start_ms: 0,
+					timeline_start_ms: 5_001,
+					duration_ms: 10_000,
+					image_zoom_duration_ms: 10_000,
+					image_zoom_end: 2
+				}
+			]);
+		} finally {
+			globalState.currentProject = previousProject;
+		}
+	});
+
+	it('exports media layout overrides for each video and image clip', () => {
+		const previousProject = globalState.currentProject;
+		const videoClip = new AssetClip(0, 5_000, 10);
+		const imageClip = new AssetClip(5_001, 10_001, 11);
+		const styles = new StylesData('global', [
+			new Category({
+				id: 'general',
+				styles: [
+					new Style({ id: 'media-fill', value: false }),
+					new Style({ id: 'media-scale', value: 100 }),
+					new Style({ id: 'media-rotation', value: 0 }),
+					new Style({ id: 'media-position-x', value: 0 }),
+					new Style({ id: 'media-position-y', value: 0 })
+				]
+			})
+		]);
+		styles.setStyleForClips([videoClip.id], 'media-fill', true);
+		styles.setStyleForClips([videoClip.id], 'media-scale', 125.5);
+		styles.setStyleForClips([videoClip.id], 'media-rotation', 90.5);
+		styles.setStyleForClips([imageClip.id], 'media-rotation', -90.25);
+		styles.setStyleForClips([imageClip.id], 'media-position-x', -20.75);
+		styles.setStyleForClips([imageClip.id], 'media-position-y', 35.25);
+		const assets = new Map([
+			[10, { filePath: 'background.mp4', type: AssetType.Video, duration: { ms: 5_000 } }],
+			[11, { filePath: 'still.png', type: AssetType.Image, duration: { ms: 0 } }]
+		]);
+		globalState.currentProject = {
+			content: {
+				timeline: { getFirstTrack: () => ({ clips: [videoClip, imageClip] }) },
+				videoStyle: { getStylesOfTarget: () => styles },
+				getAssetById: (id: number) => assets.get(id)
+			}
+		} as unknown as Project;
+
+		try {
+			expect(ExportMediaInputBuilder.getVideoInputs()).toEqual([
+				expect.objectContaining({
+					path: 'background.mp4',
+					media_fill: true,
+					media_scale: 125.5,
+					media_rotation: 90.5
+				}),
+				expect.objectContaining({
+					path: 'still.png',
+					media_position_x: -20.75,
+					media_position_y: 35.25,
+					media_rotation: -90.25
+				})
+			]);
+		} finally {
+			globalState.currentProject = previousProject;
+		}
+	});
+});
+
+describe('Subtitle JSON export', () => {
+	it('generates the same project-scoped JSON payload used by individual exports', () => {
+		const clip = new SubtitleClip(250, 1250, 1, 2, 0, 1, 'verse', [], true, true);
+		const project = {
+			detail: { id: 42, name: 'Al-Fatiha', reciter: 'Reciter' },
+			content: { timeline: { getFirstTrack: () => ({ clips: [clip] }) } }
+		} as unknown as Project;
+
+		const generated = Exporter.generateSubtitlesJson(project);
+		const payload = JSON.parse(generated.content);
+
+		expect(generated.segmentCount).toBe(1);
+		expect(payload.project).toEqual({ id: 42, name: 'Al-Fatiha', reciter: 'Reciter' });
+		expect(payload.segmentCount).toBe(1);
+		expect(payload.segments[0]).toMatchObject({ startTimeMs: 250, endTimeMs: 1250 });
+	});
+});
+
+describe('Batch backup', () => {
+	it('exports one batch and its projects in the version 2 backup format', async () => {
+		const batch = Batch.fromJSON({
+			version: 1,
+			id: 123,
+			name: 'Complete Quran',
+			createdAt: new Date().toISOString(),
+			updatedAt: new Date().toISOString(),
+			projects: [{ order: 1, projectId: 456 }]
+		}) as Batch;
+		vi.spyOn(BatchService, 'load').mockResolvedValue(batch);
+		vi.spyOn(ProjectService, 'load').mockResolvedValue({ detail: { id: 456 } } as Project);
+		const saveBackup = vi
+			.spyOn(ExportFileService, 'saveTextFile')
+			.mockResolvedValue('/backup.json');
+
+		await Exporter.backupBatch(batch.id);
+
+		const backup = JSON.parse(saveBackup.mock.calls[0][1]);
+		expect(backup.version).toBe(2);
+		expect(backup.projects.map((project: Project) => project.detail.id)).toEqual([456]);
+		expect(backup.batches.map((savedBatch: Batch) => savedBatch.id)).toEqual([123]);
+	});
+});
